@@ -47,3 +47,28 @@ def parse_response_json_text(response: dict) -> dict:
     if not text:
         return {}
     return json.loads(text)
+
+
+def detect_image_media_type(
+    image_bytes: bytes, fallback_media_type: str | None = None
+) -> str | None:
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if image_bytes.startswith(b"BM"):
+        return "image/bmp"
+    if (
+        len(image_bytes) >= 12
+        and image_bytes[0:4] == b"RIFF"
+        and image_bytes[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+
+    if fallback_media_type:
+        media_type = fallback_media_type.split(";", 1)[0].strip().lower()
+        if media_type.startswith("image/"):
+            return media_type
+    return None

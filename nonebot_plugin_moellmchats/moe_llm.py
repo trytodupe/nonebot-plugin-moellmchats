@@ -19,6 +19,7 @@ from .Search import Search
 from .TemperamentManager import temperament_manager
 from .response_utils import (
     build_image_reference,
+    detect_image_media_type,
     extract_response_output_text,
     normalize_image_summary,
     parse_response_json_text,
@@ -278,7 +279,11 @@ class MoeLlm:
                 if response.status != 200:
                     raise RuntimeError(f"图片下载失败: {response.status}")
                 image_bytes = await response.read()
-                mime_type = response.content_type or "application/octet-stream"
+                mime_type = detect_image_media_type(
+                    image_bytes, response.content_type
+                )
+                if not mime_type:
+                    raise RuntimeError("图片格式无法识别或当前不受支持")
             digest = hashlib.sha256(image_bytes).hexdigest()
             image_id = f"img_sha256_{digest[:16]}"
             summary = image_memory_store.get_summary(image_id)

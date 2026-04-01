@@ -13,6 +13,7 @@ assert spec.loader is not None
 spec.loader.exec_module(response_utils)
 
 build_image_reference = response_utils.build_image_reference
+detect_image_media_type = response_utils.detect_image_media_type
 extract_response_output_text = response_utils.extract_response_output_text
 parse_response_json_text = response_utils.parse_response_json_text
 replace_image_placeholders = response_utils.replace_image_placeholders
@@ -64,6 +65,31 @@ class ResponseUtilsTest(unittest.TestCase):
             extract_response_output_text(response),
             '{"assistant_reply":"ok","image_memories":[]}',
         )
+
+    def test_detect_image_media_type_from_magic_bytes(self):
+        self.assertEqual(
+            detect_image_media_type(b"\xff\xd8\xff\xdb\x00\x43"),
+            "image/jpeg",
+        )
+        self.assertEqual(
+            detect_image_media_type(b"\x89PNG\r\n\x1a\nrest"),
+            "image/png",
+        )
+        self.assertEqual(
+            detect_image_media_type(b"GIF89arest"),
+            "image/gif",
+        )
+        self.assertEqual(
+            detect_image_media_type(b"RIFF1234WEBPrest"),
+            "image/webp",
+        )
+
+    def test_detect_image_media_type_fallback(self):
+        self.assertEqual(
+            detect_image_media_type(b"not-an-image", "image/png; charset=binary"),
+            "image/png",
+        )
+        self.assertIsNone(detect_image_media_type(b"not-an-image", "application/octet-stream"))
 
 
 if __name__ == "__main__":
