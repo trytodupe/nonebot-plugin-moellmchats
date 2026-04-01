@@ -1,6 +1,6 @@
 from nonebot.plugin.on import on_message, on_notice, on_command, on_fullmatch
 from nonebot.plugin import PluginMetadata, require
-from nonebot.rule import to_me
+from nonebot.rule import Rule, to_me
 from nonebot.permission import SUPERUSER
 from nonebot.params import CommandArg
 import asyncio
@@ -207,8 +207,17 @@ async def handle_llm(
         cd[user_id] = 0
 
 
+async def at_me_only(bot: Bot, event: MessageEvent) -> bool:
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    for seg in event.original_message:
+        if seg.type == "at" and str(seg.data.get("qq")) == str(bot.self_id):
+            return True
+    return False
+
+
 llm_matcher = on_message(
-    rule=to_me(),
+    rule=Rule(at_me_only),
     permission=GROUP,
     priority=99,
     block=True,
