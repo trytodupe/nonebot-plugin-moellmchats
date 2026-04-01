@@ -436,9 +436,12 @@ class MoeLlm:
     async def get_llm_chat(self) -> str | bool:
         self.messages_handler = MessagesHandler(self.user_id)
         plain = self.messages_handler.pre_process(self.format_message_dict)
-        internet_required = False
         key_word = ""
-        if model_selector.get_moe() or model_selector.get_web_search():
+        self.model_info = model_selector.get_model("selected_model")
+        skip_category = self._use_responses_api() and self._use_native_web_search()
+        internet_required = skip_category and model_selector.get_web_search()
+
+        if not skip_category and (model_selector.get_moe() or model_selector.get_web_search()):
             category = Categorize(plain)
             category_result = await category.get_category()
             if isinstance(category_result, str):
@@ -462,6 +465,9 @@ class MoeLlm:
                             )
                     else:
                         self.model_info = model_selector.get_moe_current_model(difficulty)
+        elif skip_category:
+            logger.info("responses + native web search enabled, skip categorize")
+
         if not self.model_info:
             self.model_info = model_selector.get_model("selected_model")
         logger.info(f"模型选择为：{self.model_info['model']}")
@@ -473,7 +479,6 @@ class MoeLlm:
         )
         if internet_required and model_selector.get_web_search() and not use_native_web_search:
             search = Search(key_word)
-            await self.bot.send(self.event, "検索中...検索中...=￣ω￣=")
             if search_result := await search.get_search():
                 self.messages_handler.search_message_handler(search_result)
                 send_message_list = self.messages_handler.get_send_message_list()
@@ -481,8 +486,6 @@ class MoeLlm:
                 await self.bot.send(self.event, "没搜到，可能没有相关内容")
             else:
                 await self.bot.send(self.event, "搜索失败，请检查日志输出")
-        elif use_native_web_search:
-            await self.bot.send(self.event, "検索中...検索中...=￣ω￣=")
 
         if not self._use_responses_api():
             send_message_list.insert(0, {"role": "system", "content": self.prompt})
