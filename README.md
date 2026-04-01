@@ -146,7 +146,7 @@ COMMAND_START=["/",""]  # 可选
   max_retry_times: 3, // 最大重试次数
   user_history_expire_seconds: 600, // 用户上下文过期时间
   cd_seconds: 0, // 每个用户冷却时间（秒）
-  search_api: "Bearer your_tavily_key", //联网搜索tavily api key。开启搜索必填，且开启MoE才能使用
+  search_api: "Bearer your_tavily_key", // 旧版 Tavily 联网搜索 key。若使用 Responses API + native web_search，可留空
   fastai_enabled: false, // 快速AI助手开关。方便快速调用纯AI助手，无角色扮演。调用快速AI助手时，仅有用户上下文，不会有群聊上下文。不会分段发送也不会发表情包。调用方法下文提到。
   emotions_enabled: false, // 是否开启表情包（只有stream和is_segmemt为true才会发送表情包，模型设置中设置）
   emotion_rate: 0.1, // 发送表情包概率（0-1）（经测试 LLM 几乎每句都会发送表情包，所以手动设置概率）
@@ -203,11 +203,29 @@ your_absolute_path/
     "url": "https://api.openai.com/v1/chat/completions",
     "key": "Bearer sk-xxx",
     "model": "gpt-4o",
+    "api_style": "chat_completions", // 可选：chat_completions(默认) 或 responses
     "is_vision": true, // 开启多模态识图能力（仅当模型支持视觉时开启）
     "stream": true
+  },
+  "gpt-5-mini-responses": {
+    "url": "http://127.0.0.1:4141/v1/responses",
+    "key": "Bearer dummy",
+    "model": "gpt-5-mini",
+    "api_style": "responses", // 使用 Responses API
+    "is_vision": true,
+    "use_native_web_search": true, // 开启后，插件会使用 OpenAI 原生 web_search tool，而不是 Tavily
+    "reasoning_effort": "low"
   }
 }
 ```
+
+新增字段说明：
+
+- `api_style`: `chat_completions` 或 `responses`。当设置为 `responses` 时，插件会改走 Responses API。
+- `use_native_web_search`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，并且总开关 `use_web_search = true`，插件将使用模型原生 `web_search` tool。
+- `reasoning_effort`: 可选，透传给 Responses API 的 `reasoning.effort`。
+
+> 使用 `responses` + `is_vision = true` 时，插件会在**首次遇到某张图片**时下载并转成 base64 发送；后续相同图片会只保留成历史文本 `[image:summary]`，避免重复上传图片内容。
 
 #### 智能调度配置 `model_config.json`(指令维护)<br>
 

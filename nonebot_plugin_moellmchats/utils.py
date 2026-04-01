@@ -82,7 +82,7 @@ def get_emotion(emoji_name: str) -> MessageSegment:
 async def format_message(event, bot) -> dict:
     text_message = []
     reply_text = ""
-    image_urls = []  # 新增：用于存储提取到的图片URL
+    image_urls = []
 
     # 1. 处理回复消息中的图片 (使用你提供的逻辑)
     if reply := event.reply:
@@ -109,12 +109,12 @@ async def format_message(event, bot) -> dict:
                 for seg in message_image:
                     if seg.type == "image":
                         if url := seg.data.get("url"):
-                            image_urls.append(url)
+                            image_urls.append({"source_url": url})
             else:  # shamrock是list
                 for message in message_list:
                     if message.get("type") == "image":
                         if url := message.get("data").get("url"):
-                            image_urls.append(url)
+                            image_urls.append({"source_url": url})
         except Exception:
             logger.warning("获取回复消息图片失败")
 
@@ -127,9 +127,8 @@ async def format_message(event, bot) -> dict:
                 text_message.append(name)
         elif msgseg.type == "image":
             text_message.append("[图片]")
-            # 新增：提取当前消息的图片URL
             if url := msgseg.data.get("url"):
-                image_urls.append(url)
+                image_urls.append({"source_url": url})
         elif msgseg.type == "face":
             pass
         elif msgseg.type == "text":
@@ -139,7 +138,6 @@ async def format_message(event, bot) -> dict:
                 else:
                     text_message.append(plain)
 
-    # 返回字典中增加 images 字段
     return {"text": text_message, "reply": reply_text, "images": image_urls}
 
 

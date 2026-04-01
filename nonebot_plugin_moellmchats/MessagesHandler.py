@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 import time
 from .Config import config_parser
+from .response_utils import build_image_reference, replace_image_placeholders
 
 messages_dict = defaultdict(
     lambda: deque(maxlen=config_parser.get_config("max_user_history"))
@@ -34,6 +35,7 @@ class MessagesHandler:
         self.messages_entity = MessagesEntity(self.timestamp)
         self.messages_entity_list = messages_dict[self.user_id]
         self.current_images = []  # 暂存当前轮次的图片
+        self.current_text = ""
 
     def clrear_messages(self):
         self.messages_entity_list = []
@@ -61,6 +63,7 @@ class MessagesHandler:
                 format_message_dict["text"].pop(0)
 
         plain = "".join(format_message_dict["text"])
+        self.current_text = plain
         self.new_user_msg = {"role": "user", "content": plain}  # 最新的问题
         self.messages_entity.add_user_msg(
             self.new_user_msg
@@ -84,6 +87,21 @@ class MessagesHandler:
             result.append(messages_entity.get_assistant_msg())
         result.append(self.messages_entity.get_user_msg())
         return result
+
+    def update_current_user_message_with_image_summaries(self):
+        if not self.current_images:
+            return
+
+        replacements = []
+        for image in self.current_images:
+            if summary := image.get("summary"):
+                replacements.append(build_image_reference(summary))
+            else:
+                replacements.append("[image]")
+
+        self.new_user_msg["content"] = replace_image_placeholders(
+            self.current_text, replacements
+        )
 
     # 后处理
     def post_process(self, assistant_msg: str = None):

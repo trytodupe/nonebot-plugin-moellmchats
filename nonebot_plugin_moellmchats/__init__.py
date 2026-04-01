@@ -45,8 +45,8 @@ message_matcher = on_message(permission=GROUP, priority=1, block=False)
 
 @message_matcher.handle()
 async def context_dict_func(bot: Bot, event: MessageEvent):
-    if event.message.extract_plain_text().strip():  # 有文字才记录
-        if message_dict := await format_message(event, bot):
+    if message_dict := await format_message(event, bot):
+        if message_dict["text"] or message_dict["images"]:
             sender_name = event.sender.card or event.sender.nickname
             llm.context_dict[event.group_id].append(
                 f"{sender_name}:{''.join(message_dict['text'])}"
@@ -217,9 +217,8 @@ llm_matcher = on_message(
 
 @llm_matcher.handle()
 async def _(bot: Bot, event: MessageEvent):
-    if event.message.extract_plain_text().strip():
-        format_message_dict = await format_message(event, bot)
-    else:
+    format_message_dict = await format_message(event, bot)
+    if not format_message_dict["text"] and not format_message_dict["images"]:
         await llm_matcher.finish(
             Message(random.choice(hello__reply))
         )  # 没有就选一个卖萌回复
@@ -236,8 +235,8 @@ if config_parser.get_config("fastai_enabled"):
 
     @ai_matcher.handle()
     async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
-        if args.extract_plain_text().strip():
-            format_message_dict = await format_message(event, bot)
+        format_message_dict = await format_message(event, bot)
+        if format_message_dict["text"] or format_message_dict["images"]:
             await handle_llm(bot, event, ai_matcher, format_message_dict, is_ai=True)
         else:
             await ai_matcher.finish(
