@@ -18,6 +18,22 @@ class TemperamentManager:
         self.temperaments = self.read_temperaments()
         self.temperament_dict = self.read_temperament()
 
+    def _default_prompt(self) -> str:
+        return "你是ai助手。回答像真人且简短"
+
+    def _normalize_temperaments(self, value) -> dict:
+        if isinstance(value, dict):
+            value.setdefault("默认", self._default_prompt())
+            return value
+        if isinstance(value, str) and value.strip():
+            return {"默认": value.strip()}
+        return {"默认": self._default_prompt()}
+
+    def _normalize_temperament_dict(self, value) -> dict:
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        return {}
+
     def get_temperament(self, qq=None) -> str:
         """根据qq获取每个群友的性格配置"""
         if qq:
@@ -33,7 +49,7 @@ class TemperamentManager:
 
     def get_temperament_prompt(self, temperament: str) -> str:
         """根据性格获取提示语"""
-        return self.temperaments.get(temperament, "你是ai助手。回答像真人且简短")
+        return self.temperaments.get(temperament, self._default_prompt())
 
     def set_temperament_dict(self, qq, temperament) -> bool:
         """设置配置项的值"""
@@ -51,26 +67,26 @@ class TemperamentManager:
             return {}
         try:
             with open(self.temperament_config, "r", encoding="utf-8") as f:
-                return json.load(f)
+                return self._normalize_temperament_dict(json.load(f))
         except Exception:
             logger.error(format_exc())
             return {}
 
     # 读取文件
     def read_temperaments(self) -> str:
-        prompt = "你是ai助手。回答像真人且简短"
+        prompt = self._default_prompt()
         if not self.temperaments_path.exists():
             self.temperaments_path.parent.mkdir(parents=True, exist_ok=True)
             self.temperaments_path.touch()
             with open(self.temperaments_path, "w", encoding="utf-8") as f:
                 json.dump({"默认": prompt}, f, ensure_ascii=False, indent=4)
-            return prompt
+            return {"默认": prompt}
         try:
             with open(self.temperaments_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                return self._normalize_temperaments(json.load(f))
         except Exception:
             logger.error(format_exc())
-            return prompt
+            return {"默认": prompt}
 
     # 性格写入文件
     def write_temperament(self, qq: int, temperament: str) -> bool:
