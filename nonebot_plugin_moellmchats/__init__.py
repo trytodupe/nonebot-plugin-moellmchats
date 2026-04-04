@@ -49,7 +49,10 @@ async def context_dict_func(bot: Bot, event: MessageEvent):
         if message_dict["text"] or message_dict["images"]:
             sender_name = event.sender.card or event.sender.nickname
             llm.context_dict[event.group_id].append(
-                f"{sender_name}:{''.join(message_dict['text'])}"
+                {
+                    "speaker_name": sender_name,
+                    "content": "".join(message_dict["text"]),
+                }
             )
         # 概率主动发
         # if random.randint(1, 100) == 1:

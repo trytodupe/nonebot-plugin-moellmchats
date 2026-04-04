@@ -214,7 +214,8 @@ your_absolute_path/
     "api_style": "responses", // 使用 Responses API
     "is_vision": true,
     "use_native_web_search": true, // 开启后，插件会使用 OpenAI 原生 web_search tool，而不是 Tavily
-    "reasoning_effort": "low"
+    "reasoning_effort": "low",
+    "verbosity": "low" // 可选：low / medium / high，群聊场景建议 low
   }
 }
 ```
@@ -224,6 +225,7 @@ your_absolute_path/
 - `api_style`: `chat_completions` 或 `responses`。当设置为 `responses` 时，插件会改走 Responses API。
 - `use_native_web_search`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，并且总开关 `use_web_search = true`，插件将使用模型原生 `web_search` tool。
 - `reasoning_effort`: 可选，透传给 Responses API 的 `reasoning.effort`。
+- `verbosity`: 可选，仅在 `api_style = "responses"` 时生效，透传给 Responses API 的 `text.verbosity`。群聊回复若嫌太像标准答案，建议设为 `low`。
 
 > 使用 `responses` + `is_vision = true` 时，插件会在**首次遇到某张图片**时下载并转成 base64 发送；后续相同图片会只保留成历史文本 `[image:summary]`，避免重复上传图片内容。
 

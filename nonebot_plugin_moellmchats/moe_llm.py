@@ -15,6 +15,7 @@ from .Config import config_parser
 from .ImageMemory import image_memory_store
 from .MessagesHandler import MessagesHandler
 from .ModelSelector import model_selector
+from .prompt_templates import build_group_chat_prompt
 from .Search import Search
 from .TemperamentManager import temperament_manager
 from .response_utils import (
@@ -49,7 +50,11 @@ class MoeLlm:
         self.temperament = temperament
         self.model_info = {}
         self.emotion_flag = False
-        self.prompt = f"{temperament_manager.get_temperament_prompt(temperament)}。我的id是{event.sender.card or event.sender.nickname}"
+        self.prompt = temperament_manager.get_temperament_prompt(temperament)
+
+    def _use_empathetic_resonance_overlay(self) -> bool:
+        # Mock toggle for now. Later this can be wired to config.json.
+        return True
 
     async def send_emotion_message(self, content: str) -> str:
         if self.emotion_flag:
@@ -229,17 +234,19 @@ class MoeLlm:
             ):
                 self.emotion_flag = True
                 emotion_prompt = (
-                    "。回复时根据回答内容，发送表情包，每次回复最多发一个表情包，格式为中括号+表情包名字，如：[表情包名字]。"
+                    "回复时可以根据内容附带一个表情包，每次回复最多发一个。"
+                    "表情包格式必须是中括号包住名字，例如：[表情包名字]。"
                     f"可选表情有{get_emotions_names()}"
                 )
             else:
                 emotion_prompt = ""
-            self.prompt += (
-                f"。现在你在一个qq群中,你只需回复我{emotion_prompt}。"
-                "群里近期聊天内容，冒号前面是id，后面是内容：\n"
-            )
             context_dict_ = list(context_dict[self.event.group_id])[:-1]
-            self.prompt += "\n".join(context_dict_)
+            self.prompt = build_group_chat_prompt(
+                self.prompt,
+                context_dict_,
+                emotion_prompt=emotion_prompt,
+                enable_empathetic_resonance=self._use_empathetic_resonance_overlay(),
+            )
 
     def _get_response_schema(self) -> dict:
         return {
@@ -373,9 +380,10 @@ class MoeLlm:
         if not group_messages:
             return
         sender_name = self.event.sender.card or self.event.sender.nickname
-        group_messages[-1] = (
-            f"{sender_name}:{self.messages_handler.new_user_msg['content']}"
-        )
+        group_messages[-1] = {
+            "speaker_name": sender_name,
+            "content": self.messages_handler.new_user_msg["content"],
+        }
 
     async def responses_llm_chat(
         self,
@@ -387,12 +395,15 @@ class MoeLlm:
         native_web_search=False,
     ) -> bool | str:
         response_input = await self._build_responses_input(session, send_message_list)
+        text_payload = {"format": self._get_response_schema()}
+        if verbosity := self.model_info.get("verbosity"):
+            text_payload["verbosity"] = verbosity
         payload = {
             "model": self.model_info["model"],
             "store": False,
             "instructions": self.prompt,
             "input": response_input,
-            "text": {"format": self._get_response_schema()},
+            "text": text_payload,
         }
         if max_tokens := self.model_info.get("max_tokens"):
             payload["max_output_tokens"] = max_tokens
