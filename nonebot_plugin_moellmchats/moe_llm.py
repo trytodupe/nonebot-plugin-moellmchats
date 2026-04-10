@@ -246,6 +246,7 @@ class MoeLlm:
                 context_dict_,
                 emotion_prompt=emotion_prompt,
                 enable_empathetic_resonance=self._use_empathetic_resonance_overlay(),
+                instruction_profile="core",
             )
 
     def _get_response_schema(self) -> dict:
