@@ -176,7 +176,11 @@ async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
 
 
 async def handle_llm(
-    bot: Bot, event: GroupMessageEvent, matcher, format_message_dict: dict, is_ai=False
+    bot: Bot,
+    event: GroupMessageEvent,
+    matcher,
+    format_message_dict: dict,
+    is_ai=False,
 ):
     # 获取消息文本
     user_id = event.sender.user_id
@@ -200,7 +204,12 @@ async def handle_llm(
         temp = temperament_manager.get_temperament(user_id)
         if not temp:
             await matcher.finish("出错了，赶快喊机器人主人来修复一下吧~")
-    llm_chat = llm.MoeLlm(bot, event, format_message_dict, temperament=temp)
+    llm_chat = llm.MoeLlm(
+        bot,
+        event,
+        format_message_dict,
+        temperament=temp,
+    )
     is_finished = await llm_chat.get_llm_chat()
     is_repeat_ask_dict[user_id] = False  # 重复提问判定就不用了
     if isinstance(is_finished, str):  # 表示失败，失败描述文字
@@ -235,7 +244,6 @@ async def _(bot: Bot, event: MessageEvent):
             Message(random.choice(hello__reply))
         )  # 没有就选一个卖萌回复
     await handle_llm(bot, event, llm_matcher, format_message_dict, is_ai=False)
-
 
 if config_parser.get_config("fastai_enabled"):
     ai_matcher = on_command(

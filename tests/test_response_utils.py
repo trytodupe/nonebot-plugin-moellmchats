@@ -14,6 +14,7 @@ spec.loader.exec_module(response_utils)
 
 build_image_reference = response_utils.build_image_reference
 detect_image_media_type = response_utils.detect_image_media_type
+extract_image_generation_calls = response_utils.extract_image_generation_calls
 extract_response_output_text = response_utils.extract_response_output_text
 parse_response_json_text = response_utils.parse_response_json_text
 replace_image_placeholders = response_utils.replace_image_placeholders
@@ -64,6 +65,32 @@ class ResponseUtilsTest(unittest.TestCase):
         self.assertEqual(
             extract_response_output_text(response),
             '{"assistant_reply":"ok","image_memories":[]}',
+        )
+
+    def test_extract_image_generation_calls(self):
+        response = {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "id": "imggen_123",
+                    "result": ["ZmFrZV9pbWFnZV8x", "ZmFrZV9pbWFnZV8y"],
+                }
+            ]
+        }
+        self.assertEqual(
+            extract_image_generation_calls(response),
+            [
+                {
+                    "result": "ZmFrZV9pbWFnZV8x",
+                    "image_id": "imggen_123",
+                    "action": None,
+                },
+                {
+                    "result": "ZmFrZV9pbWFnZV8y",
+                    "image_id": "imggen_123",
+                    "action": None,
+                },
+            ],
         )
 
     def test_detect_image_media_type_from_magic_bytes(self):

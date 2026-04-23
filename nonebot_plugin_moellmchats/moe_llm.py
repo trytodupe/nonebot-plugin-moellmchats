@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 
 import aiohttp
 import ujson as json
+from nonebot.adapters.onebot.v11 import MessageSegment
 from nonebot.log import logger
 
 from .Categorize import Categorize
@@ -21,6 +22,7 @@ from .TemperamentManager import temperament_manager
 from .response_utils import (
     build_image_reference,
     detect_image_media_type,
+    extract_image_generation_calls,
     extract_response_output_text,
     normalize_image_summary,
     parse_response_json_text,
@@ -96,6 +98,9 @@ class MoeLlm:
 
     def _use_native_web_search(self) -> bool:
         return bool(self.model_info.get("use_native_web_search"))
+
+    def _use_native_image_generation(self) -> bool:
+        return bool(self.model_info.get("use_native_image_generation"))
 
     async def stream_llm_chat(
         self, session, url, headers, data, proxy, is_segment=False
@@ -276,6 +281,36 @@ class MoeLlm:
             },
         }
 
+    def _build_responses_tools(
+        self,
+        *,
+        native_web_search: bool = False,
+        native_image_generation: bool = False,
+    ) -> tuple[list[dict], list[str]]:
+        tools = []
+        include = []
+        if native_web_search:
+            tools.append({"type": "web_search"})
+            include.append("web_search_call.action.sources")
+        if native_image_generation:
+            tools.append({"type": "image_generation"})
+        return tools, include
+
+    async def _send_generated_images(self, image_calls: list[dict]) -> int:
+        sent_count = 0
+        for image_call in image_calls:
+            image_base64 = image_call.get("result")
+            if not image_base64:
+                continue
+            try:
+                image_bytes = base64.b64decode(image_base64)
+            except Exception:
+                logger.warning("生成图片 base64 解码失败")
+                continue
+            await self.bot.send(self.event, MessageSegment.image(image_bytes))
+            sent_count += 1
+        return sent_count
+
     async def _prepare_current_images(self, session) -> list[dict]:
         prepared = []
         proxy = self.model_info.get("proxy")
@@ -394,6 +429,7 @@ class MoeLlm:
         send_message_list,
         proxy,
         native_web_search=False,
+        native_image_generation=False,
     ) -> bool | str:
         response_input = await self._build_responses_input(session, send_message_list)
         text_payload = {"format": self._get_response_schema()}
@@ -410,10 +446,15 @@ class MoeLlm:
             payload["max_output_tokens"] = max_tokens
         if reasoning_effort := self.model_info.get("reasoning_effort"):
             payload["reasoning"] = {"effort": reasoning_effort}
-        if native_web_search:
-            payload["tools"] = [{"type": "web_search"}]
+        tools, include = self._build_responses_tools(
+            native_web_search=native_web_search,
+            native_image_generation=native_image_generation,
+        )
+        if tools:
+            payload["tools"] = tools
             payload["tool_choice"] = "auto"
-            payload["include"] = ["web_search_call.action.sources"]
+        if include:
+            payload["include"] = include
 
         async with session.post(
             url,
@@ -435,19 +476,26 @@ class MoeLlm:
             logger.warning(traceback.format_exc())
             structured = {}
 
+        image_calls = extract_image_generation_calls(body)
         assistant_reply = (structured.get("assistant_reply") or "").strip()
         if not assistant_reply:
             assistant_reply = extract_response_output_text(body)
-        if not assistant_reply:
+        if not assistant_reply and not image_calls:
             logger.warning(body)
             return False
 
         image_memories = structured.get("image_memories") or []
         self._apply_image_memory_updates(image_memories)
         self._sync_group_context_with_current_user_message()
-        if not self.is_objective:
+        if not self.is_objective and assistant_reply:
             self.messages_handler.post_process(assistant_reply)
-        await self.bot.send(self.event, assistant_reply)
+
+        sent_images = await self._send_generated_images(image_calls)
+        if assistant_reply:
+            await self.bot.send(self.event, assistant_reply)
+        elif sent_images == 0:
+            logger.warning(body)
+            return False
         return True
 
     async def get_llm_chat(self) -> str | bool:
@@ -494,6 +542,7 @@ class MoeLlm:
         use_native_web_search = (
             internet_required and model_selector.get_web_search() and self._use_native_web_search()
         )
+        use_native_image_generation = self._use_native_image_generation()
         if internet_required and model_selector.get_web_search() and not use_native_web_search:
             search = Search(key_word)
             if search_result := await search.get_search():
@@ -560,6 +609,7 @@ class MoeLlm:
                             send_message_list,
                             self.model_info.get("proxy"),
                             native_web_search=use_native_web_search,
+                            native_image_generation=use_native_image_generation,
                         )
                     elif self.model_info.get("stream"):
                         result = await self.stream_llm_chat(

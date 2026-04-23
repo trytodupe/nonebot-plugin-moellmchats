@@ -42,6 +42,38 @@ def extract_response_output_text(response: dict) -> str:
     return (response.get("output_text") or "").strip()
 
 
+def extract_image_generation_calls(response: dict) -> list[dict]:
+    calls = []
+    for item in response.get("output", []):
+        if item.get("type") != "image_generation_call":
+            continue
+
+        result = item.get("result")
+        if isinstance(result, str) and result.strip():
+            calls.append(
+                {
+                    "result": result,
+                    "image_id": item.get("id") or item.get("image_id"),
+                    "action": item.get("action"),
+                }
+            )
+            continue
+
+        if not isinstance(result, list):
+            continue
+
+        for entry in result:
+            if isinstance(entry, str) and entry.strip():
+                calls.append(
+                    {
+                        "result": entry,
+                        "image_id": item.get("id") or item.get("image_id"),
+                        "action": item.get("action"),
+                    }
+                )
+    return calls
+
+
 def parse_response_json_text(response: dict) -> dict:
     text = extract_response_output_text(response)
     if not text:

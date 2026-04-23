@@ -47,6 +47,16 @@ class ModelSelector:
                     "top_k": 5,
                     "top_p": 1.0,
                 },
+                "gpt-5.4-responses": {
+                    "url": "https://api.openai.com/v1/responses",
+                    "key": "Bearer sk-xxx",
+                    "model": "gpt-5.4",
+                    "api_style": "responses",
+                    "use_native_web_search": True,
+                    "use_native_image_generation": True,
+                    "reasoning_effort": "low",
+                    "verbosity": "low",
+                },
             }
             self.models_file.parent.mkdir(parents=True, exist_ok=True)
             self.models_file.touch()
