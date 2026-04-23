@@ -410,6 +410,8 @@ class MoeLlm:
         streamed_text_chunks = []
         streamed_image_calls = {}
         partial_image_calls = {}
+        sent_stream_image_ids = set()
+        sent_stream_image_count = 0
         try:
             async with client.responses.stream(**payload) as stream:
                 async for event in stream:
@@ -433,10 +435,14 @@ class MoeLlm:
                         item_id = getattr(event, "item_id", None)
                         partial_image_b64 = getattr(event, "partial_image_b64", None)
                         if item_id and partial_image_b64:
-                            partial_image_calls[item_id] = {
+                            image_call = {
                                 "result": partial_image_b64,
                                 "image_id": item_id,
                             }
+                            partial_image_calls[item_id] = image_call
+                            if item_id not in sent_stream_image_ids:
+                                sent_stream_image_count += await self._send_generated_images([image_call])
+                                sent_stream_image_ids.add(item_id)
                     if (
                         native_image_generation
                         and not generation_notice_sent
@@ -447,6 +453,8 @@ class MoeLlm:
                 final_response = await stream.get_final_response()
         except Exception as exc:
             logger.error(traceback.format_exc())
+            if sent_stream_image_count > 0:
+                return True
             return self._format_upstream_error(exc)
         finally:
             await client.close()
@@ -459,6 +467,11 @@ class MoeLlm:
             image_calls = list(streamed_image_calls.values())
         if not image_calls:
             image_calls = list(partial_image_calls.values())
+        image_calls = [
+            image_call
+            for image_call in image_calls
+            if image_call.get("image_id") not in sent_stream_image_ids
+        ]
 
         assistant_reply = "".join(streamed_text_chunks).strip()
         if not assistant_reply:
@@ -491,7 +504,7 @@ class MoeLlm:
         if not self.is_objective and assistant_reply:
             self.messages_handler.post_process(assistant_reply)
 
-        sent_images = await self._send_generated_images(image_calls)
+        sent_images = sent_stream_image_count + await self._send_generated_images(image_calls)
         if assistant_reply:
             await self.bot.send(self.event, assistant_reply)
         elif sent_images == 0:
