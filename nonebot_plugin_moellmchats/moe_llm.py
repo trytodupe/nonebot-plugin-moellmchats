@@ -55,6 +55,12 @@ class MoeLlm:
         self.model_info = {}
         self.prompt = BASE_PROMPT
 
+    def _format_upstream_error(self, exc: Exception) -> str:
+        message = str(exc).strip()
+        if not message:
+            return type(exc).__name__
+        return message
+
     async def _check_400_error(self, response) -> str | None:
         if response.status == 400:
             error_content = await response.text()
@@ -439,9 +445,9 @@ class MoeLlm:
                         await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
                         generation_notice_sent = True
                 final_response = await stream.get_final_response()
-        except Exception:
+        except Exception as exc:
             logger.error(traceback.format_exc())
-            return False
+            return self._format_upstream_error(exc)
         finally:
             await client.close()
             if http_client is not None:
@@ -575,7 +581,7 @@ class MoeLlm:
                 return str(exc)
             except TimeoutError:
                 return "请求超时。"
-            except Exception:
+            except Exception as exc:
                 logger.warning(str(send_message_list))
                 logger.error(traceback.format_exc())
-                return "请求失败。"
+                return self._format_upstream_error(exc)
