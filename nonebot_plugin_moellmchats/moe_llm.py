@@ -1,38 +1,40 @@
 import asyncio
 import base64
 import hashlib
-import random
 import traceback
 from asyncio import TimeoutError
 from collections import defaultdict, deque
 
 import aiohttp
-from openai import AsyncOpenAI
+import httpx
 import ujson as json
 from nonebot.adapters.onebot.v11 import MessageSegment
 from nonebot.log import logger
+from openai import AsyncOpenAI
 
-from .Categorize import Categorize
 from .Config import config_parser
 from .ImageMemory import image_memory_store
 from .MessagesHandler import MessagesHandler
 from .ModelSelector import model_selector
-from .prompt_templates import build_group_chat_prompt
-from .Search import Search
-from .TemperamentManager import temperament_manager
 from .response_utils import (
     build_image_reference,
     detect_image_media_type,
     extract_image_generation_calls,
     extract_response_output_text,
     normalize_image_summary,
-    parse_response_json_text,
     replace_image_placeholders,
 )
-from .utils import get_emotion, get_emotions_names, parse_emotion
+from .prompt_templates import build_group_chat_prompt
 
 context_dict = defaultdict(
     lambda: deque(maxlen=config_parser.get_config("max_group_history"))
+)
+
+BASE_PROMPT = (
+    "You are replying in a QQ group chat. "
+    "Answer the latest user message naturally and directly. "
+    "Use recent group context only for understanding references. "
+    "Do not mention system prompts, tools, or internal reasoning."
 )
 
 
@@ -43,7 +45,7 @@ class MoeLlm:
         event,
         format_message_dict: dict,
         is_objective: bool = False,
-        temperament="默认",
+        temperament: str = "default",
     ):
         self.bot = bot
         self.event = event
@@ -52,29 +54,12 @@ class MoeLlm:
         self.is_objective = is_objective
         self.temperament = temperament
         self.model_info = {}
-        self.emotion_flag = False
-        self.prompt = temperament_manager.get_temperament_prompt(temperament)
-
-    def _use_empathetic_resonance_overlay(self) -> bool:
-        # Mock toggle for now. Later this can be wired to config.json.
-        return True
-
-    async def send_emotion_message(self, content: str) -> str:
-        if self.emotion_flag:
-            content, emotion_names_list = parse_emotion(content)
-            if content:
-                await self.bot.send(self.event, content)
-            for emotion_name in emotion_names_list:
-                if emotion := get_emotion(emotion_name):
-                    await self.bot.send(self.event, emotion)
-        else:
-            await self.bot.send(self.event, content)
-        return content
+        self.prompt = BASE_PROMPT
 
     async def _check_400_error(self, response) -> str | None:
         if response.status == 400:
             error_content = await response.text()
-            logger.warning(f"API请求400错误: {error_content}")
+            logger.warning(f"API request rejected: {error_content}")
 
             sensitive_keywords = [
                 "DataInspectionFailed",
@@ -85,10 +70,9 @@ class MoeLlm:
                 "audit",
                 "prohibited",
             ]
-
             if any(k.lower() in error_content.lower() for k in sensitive_keywords):
-                return "图片或内容可能包含敏感信息，被AI审核拦截了喵 >_<"
-            return "API请求被拒绝 (400)，请检查后台日志。"
+                return "请求被内容审核拦截。"
+            return "API 请求被拒绝。"
         return None
 
     def _use_responses_api(self) -> bool:
@@ -103,95 +87,49 @@ class MoeLlm:
     def _use_native_image_generation(self) -> bool:
         return bool(self.model_info.get("use_native_image_generation"))
 
+    def prompt_handler(self):
+        recent_context = list(context_dict[self.event.group_id])[:-1]
+        self.prompt = build_group_chat_prompt(
+            BASE_PROMPT,
+            recent_context,
+            instruction_profile="minimal",
+        )
+
     async def stream_llm_chat(
         self, session, url, headers, data, proxy, is_segment=False
     ) -> bool | str:
         buffer = []
-        assistant_result = []
-        punctuation_buffer = ""
-        is_second_send = False
         async with session.post(url, headers=headers, json=data, proxy=proxy) as response:
             if error_msg := await self._check_400_error(response):
                 return error_msg
-            if response.status == 200:
-                max_segments = self.model_info.get("max_segments", 5)
-                current_segment = 0
-                jump_out = False
-                current_content = ""
-                async for line in response.content:
-                    if (
-                        not line
-                        or line.startswith(b"data: [DONE]")
-                        or line.startswith(b"[DONE]")
-                        or jump_out
-                    ):
-                        break
-                    if line.startswith(b"data:"):
-                        decoded = line[5:].decode("utf-8")
-                    else:
-                        decoded = line.decode("utf-8")
-                    if not decoded.strip() or decoded.startswith(":"):
-                        continue
-                    json_data = json.loads(decoded)
-                    content = ""
-                    choices = json_data.get("choices", [{}])
-                    if not choices:
-                        continue
-                    if message := choices[0].get("message", {}):
-                        content = message.get("content", "")
-                    elif message := choices[0].get("delta", {}):
-                        content = message.get("content", "")
-                    if not content:
-                        continue
-                    if is_segment and self.temperament != "ai助手":
-                        for char in content:
-                            if char in ["。", "？", "！", "—", "\n"]:
-                                punctuation_buffer += char
-                            else:
-                                if punctuation_buffer:
-                                    current_content = (
-                                        "".join(buffer) + punctuation_buffer
-                                    ).strip()
-                                    if current_content:
-                                        if current_segment >= max_segments:
-                                            buffer = ["太长了，不发了"]
-                                            jump_out = True
-                                            break
-                                        if is_second_send:
-                                            await asyncio.sleep(
-                                                2 + len(current_content) / 3
-                                            )
-                                        else:
-                                            is_second_send = True
-                                        current_content = await self.send_emotion_message(
-                                            current_content
-                                        )
-                                        current_segment += 1
-                                        assistant_result.append(current_content)
-                                    buffer = []
-                                    punctuation_buffer = ""
-                                buffer.append(char)
-                    else:
-                        buffer.append(content)
-                result = "".join(buffer) if jump_out else "".join(buffer) + punctuation_buffer
-                if is_second_send and current_content:
-                    await asyncio.sleep(2 + len(current_content) / 3)
-                elif result.strip():
-                    is_second_send = True
-                if result := result.strip():
-                    result = await self.send_emotion_message(result)
-                    if not self.is_objective:
-                        self.messages_handler.post_process(
-                            "".join(assistant_result) + result
-                        )
-                    return True
-                if is_second_send:
-                    if not self.is_objective:
-                        self.messages_handler.post_process("".join(assistant_result))
-                    return True
-            else:
+            if response.status != 200:
                 logger.warning(f"Warning: {response}")
-        return False
+                return False
+            async for line in response.content:
+                if not line or line.startswith(b"data: [DONE]") or line.startswith(b"[DONE]"):
+                    break
+                decoded = (
+                    line[5:].decode("utf-8")
+                    if line.startswith(b"data:")
+                    else line.decode("utf-8")
+                )
+                if not decoded.strip() or decoded.startswith(":"):
+                    continue
+                json_data = json.loads(decoded)
+                choices = json_data.get("choices", [{}])
+                if not choices:
+                    continue
+                message = choices[0].get("message", {}) or choices[0].get("delta", {})
+                content = message.get("content", "")
+                if content:
+                    buffer.append(content)
+        result = "".join(buffer).strip()
+        if not result:
+            return False
+        if not self.is_objective:
+            self.messages_handler.post_process(result)
+        await self.bot.send(self.event, result)
+        return True
 
     async def none_stream_llm_chat(self, session, url, headers, data, proxy) -> bool | str:
         async with session.post(
@@ -207,53 +145,31 @@ class MoeLlm:
             if resp.status != 200 or not response:
                 logger.warning(response)
                 return False
-        if choices := response.get("choices"):
-            content = choices[0]["message"]["content"]
-            start_tag = "<think>"
-            end_tag = "</think>"
-            start = content.find(start_tag)
-            end = content.find(end_tag)
-            if start == -1 and end != -1:
-                end += len(end_tag)
-                start = 0
-                result = content[:start] + content[end:]
-            elif start != -1 and end != -1:
-                end += len(end_tag)
-                result = content[:start] + content[end:]
-            else:
-                result = content
-        else:
+        choices = response.get("choices")
+        if not choices:
             logger.warning(response)
             return False
+        content = choices[0]["message"]["content"]
+        start_tag = "<think>"
+        end_tag = "</think>"
+        start = content.find(start_tag)
+        end = content.find(end_tag)
+        if start == -1 and end != -1:
+            end += len(end_tag)
+            start = 0
+            result = content[:start] + content[end:]
+        elif start != -1 and end != -1:
+            end += len(end_tag)
+            result = content[:start] + content[end:]
+        else:
+            result = content
+        result = result.strip()
+        if not result:
+            return False
         if not self.is_objective:
-            self.messages_handler.post_process(result.strip())
-        await self.bot.send(self.event, result.strip())
+            self.messages_handler.post_process(result)
+        await self.bot.send(self.event, result)
         return True
-
-    def prompt_handler(self):
-        if self.temperament != "ai助手":
-            if (
-                config_parser.get_config("emotions_enabled")
-                and self.model_info.get("is_segment")
-                and self.model_info.get("stream")
-                and random.random() < config_parser.get_config("emotion_rate")
-            ):
-                self.emotion_flag = True
-                emotion_prompt = (
-                    "回复时可以根据内容附带一个表情包，每次回复最多发一个。"
-                    "表情包格式必须是中括号包住名字，例如：[表情包名字]。"
-                    f"可选表情有{get_emotions_names()}"
-                )
-            else:
-                emotion_prompt = ""
-            context_dict_ = list(context_dict[self.event.group_id])[:-1]
-            self.prompt = build_group_chat_prompt(
-                self.prompt,
-                context_dict_,
-                emotion_prompt=emotion_prompt,
-                enable_empathetic_resonance=self._use_empathetic_resonance_overlay(),
-                instruction_profile="core",
-            )
 
     def _get_response_schema(self) -> dict:
         return {
@@ -306,7 +222,7 @@ class MoeLlm:
             try:
                 image_bytes = base64.b64decode(image_base64)
             except Exception:
-                logger.warning("生成图片 base64 解码失败")
+                logger.warning("Failed to decode generated image")
                 continue
             await self.bot.send(self.event, MessageSegment.image(image_bytes))
             sent_count += 1
@@ -335,11 +251,13 @@ class MoeLlm:
             image["mime_type"] = mime_type
             if summary:
                 image["summary"] = summary
-                prepared.append({
-                    "image_id": image_id,
-                    "summary": summary,
-                    "known": True,
-                })
+                prepared.append(
+                    {
+                        "image_id": image_id,
+                        "summary": summary,
+                        "known": True,
+                    }
+                )
                 continue
             data_url = f"data:{mime_type};base64," + base64.b64encode(image_bytes).decode()
             prepared.append(
@@ -422,6 +340,15 @@ class MoeLlm:
             "content": self.messages_handler.new_user_msg["content"],
         }
 
+    def _extract_stream_text_delta(self, event) -> str:
+        delta = getattr(event, "delta", None)
+        if isinstance(delta, str):
+            return delta
+        text = getattr(event, "text", None)
+        if isinstance(text, str):
+            return text
+        return ""
+
     async def responses_llm_chat(
         self,
         url,
@@ -431,17 +358,21 @@ class MoeLlm:
         native_web_search=False,
         native_image_generation=False,
     ) -> bool | str:
-        response_input = await self._build_responses_input(session, send_message_list)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300)
+        ) as input_session:
+            response_input = await self._build_responses_input(input_session, send_message_list)
+
         text_payload = {"format": self._get_response_schema()}
         if verbosity := self.model_info.get("verbosity"):
             text_payload["verbosity"] = verbosity
+
         payload = {
             "model": self.model_info["model"],
             "store": False,
             "instructions": self.prompt,
             "input": response_input,
             "text": text_payload,
-            "stream": True,
         }
         if max_tokens := self.model_info.get("max_tokens"):
             payload["max_output_tokens"] = max_tokens
@@ -456,22 +387,55 @@ class MoeLlm:
             payload["tool_choice"] = "auto"
         if include:
             payload["include"] = include
+
         api_key = self.model_info["key"].removeprefix("Bearer").strip()
         base_url = url.rsplit("/", 1)[0]
-        client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=300,
-        )
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "timeout": 300,
+        }
+        http_client = None
+        if proxy:
+            http_client = httpx.AsyncClient(proxy=proxy, timeout=300)
+            client_kwargs["http_client"] = http_client
+        client = AsyncOpenAI(**client_kwargs)
+
         generation_notice_sent = False
+        streamed_text_chunks = []
+        streamed_image_calls = {}
+        partial_image_calls = {}
         try:
             async with client.responses.stream(**payload) as stream:
                 async for event in stream:
                     event_type = getattr(event, "type", "")
+                    if event_type == "response.output_text.delta":
+                        if delta := self._extract_stream_text_delta(event):
+                            streamed_text_chunks.append(delta)
+                    elif event_type == "response.output_item.done":
+                        item = getattr(event, "item", None)
+                        if (
+                            item is not None
+                            and getattr(item, "type", "") == "image_generation_call"
+                            and getattr(item, "result", None)
+                        ):
+                            item_id = getattr(item, "id", None) or f"output_{getattr(event, 'output_index', 0)}"
+                            streamed_image_calls[item_id] = {
+                                "result": item.result,
+                                "image_id": item_id,
+                            }
+                    elif event_type == "response.image_generation_call.partial_image":
+                        item_id = getattr(event, "item_id", None)
+                        partial_image_b64 = getattr(event, "partial_image_b64", None)
+                        if item_id and partial_image_b64:
+                            partial_image_calls[item_id] = {
+                                "result": partial_image_b64,
+                                "image_id": item_id,
+                            }
                     if (
                         native_image_generation
                         and not generation_notice_sent
-                        and "image_gen_call" in event_type
+                        and "image_generation_call" in event_type
                     ):
                         await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
                         generation_notice_sent = True
@@ -479,23 +443,44 @@ class MoeLlm:
         except Exception:
             logger.error(traceback.format_exc())
             return False
-        body = final_response.model_dump(mode="json")
+        finally:
+            await client.close()
+            if http_client is not None:
+                await http_client.aclose()
 
-        try:
-            structured = parse_response_json_text(body)
-        except Exception:
-            logger.warning(traceback.format_exc())
-            structured = {}
-
+        body = final_response.model_dump(mode="json", warnings=False)
         image_calls = extract_image_generation_calls(body)
-        assistant_reply = (structured.get("assistant_reply") or "").strip()
-        if not assistant_reply and not image_calls:
+        if not image_calls:
+            image_calls = list(streamed_image_calls.values())
+        if not image_calls:
+            image_calls = list(partial_image_calls.values())
+
+        assistant_reply = "".join(streamed_text_chunks).strip()
+        if not assistant_reply:
             assistant_reply = extract_response_output_text(body)
+
+        image_memories = []
+        output_text_obj = getattr(final_response, "output_text", None)
+        if output_text_obj and isinstance(output_text_obj, str):
+            try:
+                parsed = json.loads(output_text_obj)
+            except ValueError:
+                parsed = {}
+            assistant_reply = (parsed.get("assistant_reply") or assistant_reply).strip()
+            image_memories = parsed.get("image_memories") or []
+        elif isinstance(assistant_reply, str):
+            try:
+                parsed = json.loads(assistant_reply)
+            except ValueError:
+                parsed = {}
+            if parsed:
+                assistant_reply = (parsed.get("assistant_reply") or "").strip()
+                image_memories = parsed.get("image_memories") or []
+
         if not assistant_reply and not image_calls:
             logger.warning(body)
             return False
 
-        image_memories = structured.get("image_memories") or []
         self._apply_image_memory_updates(image_memories)
         self._sync_group_context_with_current_user_message()
         if not self.is_objective and assistant_reply:
@@ -511,65 +496,23 @@ class MoeLlm:
 
     async def get_llm_chat(self) -> str | bool:
         self.messages_handler = MessagesHandler(self.user_id)
-        plain = self.messages_handler.pre_process(self.format_message_dict)
-        key_word = ""
+        self.messages_handler.pre_process(self.format_message_dict)
         self.model_info = model_selector.get_model("selected_model")
-        skip_category = self._use_responses_api() and self._use_native_web_search()
-        internet_required = skip_category and model_selector.get_web_search()
-
-        if not skip_category and (model_selector.get_moe() or model_selector.get_web_search()):
-            category = Categorize(plain)
-            category_result = await category.get_category()
-            if isinstance(category_result, str):
-                return category_result
-            if isinstance(category_result, tuple):
-                difficulty, internet_required, key_word, vision_required = category_result
-                logger.info(
-                    f"难度：{difficulty}, 联网：{internet_required}, 关键词：{key_word}, 视觉：{vision_required}"
-                )
-                if model_selector.get_moe():
-                    if vision_required and self.messages_handler.current_images:
-                        vision_model_key = model_selector.model_config.get("vision_model")
-                        if vision_model_key:
-                            self.model_info = model_selector.get_model("vision_model")
-                            logger.info(
-                                f"触发视觉任务，切换至视觉模型: {self.model_info['model']}"
-                            )
-                        else:
-                            logger.info(
-                                "触发视觉任务，但配置文件 model_config.json 缺少 vision_model 字段，退回普通模型"
-                            )
-                    else:
-                        self.model_info = model_selector.get_moe_current_model(difficulty)
-        elif skip_category:
-            logger.info("responses + native web search enabled, skip categorize")
-
         if not self.model_info:
-            self.model_info = model_selector.get_model("selected_model")
+            return "未找到可用模型配置。"
+
         logger.info(f"模型选择为：{self.model_info['model']}")
         self.prompt_handler()
         send_message_list = self.messages_handler.get_send_message_list()
 
         use_native_web_search = (
-            internet_required and model_selector.get_web_search() and self._use_native_web_search()
+            model_selector.get_web_search() and self._use_native_web_search()
         )
         use_native_image_generation = self._use_native_image_generation()
-        if internet_required and model_selector.get_web_search() and not use_native_web_search:
-            search = Search(key_word)
-            if search_result := await search.get_search():
-                self.messages_handler.search_message_handler(search_result)
-                send_message_list = self.messages_handler.get_send_message_list()
-            elif isinstance(search_result, bool):
-                await self.bot.send(self.event, "没搜到，可能没有相关内容")
-            else:
-                await self.bot.send(self.event, "搜索失败，请检查日志输出")
 
         if not self._use_responses_api():
             send_message_list.insert(0, {"role": "system", "content": self.prompt})
             if self.model_info.get("is_vision") and self.messages_handler.current_images:
-                logger.info(
-                    f"检测到多模态模型 {self.model_info['model']} 且存在图片，正在构建多模态请求..."
-                )
                 current_msg = send_message_list[-1]
                 vision_content = [{"type": "text", "text": current_msg["content"]}]
                 for image in self.messages_handler.current_images:
@@ -599,53 +542,41 @@ class MoeLlm:
             "Content-Type": "application/json",
             "Accept-Encoding": "identity",
         }
+
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300)
         ) as session:
-            max_retry_times = config_parser.get_config("max_retry_times") or 3
-            result = ""
-            for retry_times in range(max_retry_times):
-                if retry_times > 0:
-                    await self.bot.send(
-                        self.event,
-                        f"api又卡了呐！第 {retry_times+1} 次尝试，请勿多次发送~",
+            try:
+                if self._use_responses_api():
+                    return await self.responses_llm_chat(
+                        self.model_info["url"],
+                        headers,
+                        send_message_list,
+                        self.model_info.get("proxy"),
+                        native_web_search=use_native_web_search,
+                        native_image_generation=use_native_image_generation,
                     )
-                    await asyncio.sleep(2 ** (retry_times + 1))
-                try:
-                    if self._use_responses_api():
-                        result = await self.responses_llm_chat(
-                            self.model_info["url"],
-                            headers,
-                            send_message_list,
-                            self.model_info.get("proxy"),
-                            native_web_search=use_native_web_search,
-                            native_image_generation=use_native_image_generation,
-                        )
-                    elif self.model_info.get("stream"):
-                        result = await self.stream_llm_chat(
-                            session,
-                            self.model_info["url"],
-                            headers,
-                            data,
-                            self.model_info.get("proxy"),
-                            self.model_info.get("is_segment"),
-                        )
-                    else:
-                        result = await self.none_stream_llm_chat(
-                            session,
-                            self.model_info["url"],
-                            headers,
-                            json.dumps(data),
-                            self.model_info.get("proxy"),
-                        )
-                    if result:
-                        return result
-                except RuntimeError as exc:
-                    return str(exc)
-                except TimeoutError:
-                    return "网络超时呐，多半是api反应太慢（"
-                except Exception:
-                    logger.warning(str(send_message_list))
-                    logger.error(traceback.format_exc())
-                    continue
-            return "api寄！"
+                if self.model_info.get("stream"):
+                    return await self.stream_llm_chat(
+                        session,
+                        self.model_info["url"],
+                        headers,
+                        data,
+                        self.model_info.get("proxy"),
+                        self.model_info.get("is_segment"),
+                    )
+                return await self.none_stream_llm_chat(
+                    session,
+                    self.model_info["url"],
+                    headers,
+                    json.dumps(data),
+                    self.model_info.get("proxy"),
+                )
+            except RuntimeError as exc:
+                return str(exc)
+            except TimeoutError:
+                return "请求超时。"
+            except Exception:
+                logger.warning(str(send_message_list))
+                logger.error(traceback.format_exc())
+                return "请求失败。"
