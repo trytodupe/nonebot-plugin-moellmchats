@@ -7,6 +7,7 @@ from asyncio import TimeoutError
 from collections import defaultdict, deque
 
 import aiohttp
+from openai import AsyncOpenAI
 import ujson as json
 from nonebot.adapters.onebot.v11 import MessageSegment
 from nonebot.log import logger
@@ -24,9 +25,7 @@ from .response_utils import (
     detect_image_media_type,
     extract_image_generation_calls,
     extract_response_output_text,
-    is_image_generation_sse_event,
     normalize_image_summary,
-    parse_sse_event_chunk,
     parse_response_json_text,
     replace_image_placeholders,
 )
@@ -425,7 +424,6 @@ class MoeLlm:
 
     async def responses_llm_chat(
         self,
-        session,
         url,
         headers,
         send_message_list,
@@ -458,38 +456,30 @@ class MoeLlm:
             payload["tool_choice"] = "auto"
         if include:
             payload["include"] = include
-
-        async with session.post(
-            url,
-            headers=headers,
-            json=payload,
-            proxy=proxy,
-            ssl=False,
-        ) as response:
-            if error_msg := await self._check_400_error(response):
-                return error_msg
-            if response.status != 200:
-                body = await response.json()
-                logger.warning(body)
-                return False
-            body = None
-            generation_notice_sent = False
-            async for chunk in response.content.iter_any():
-                for event in parse_sse_event_chunk(chunk):
-                    event_name = event.get("event")
-                    payload = event.get("data", {})
+        api_key = self.model_info["key"].removeprefix("Bearer").strip()
+        base_url = url.rsplit("/", 1)[0]
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=300,
+        )
+        generation_notice_sent = False
+        try:
+            async with client.responses.stream(**payload) as stream:
+                async for event in stream:
+                    event_type = getattr(event, "type", "")
                     if (
                         native_image_generation
                         and not generation_notice_sent
-                        and is_image_generation_sse_event(event_name, payload)
+                        and "image_gen_call" in event_type
                     ):
                         await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
                         generation_notice_sent = True
-                    if event_name == "response.completed":
-                        body = payload.get("response") or payload
-            if body is None:
-                logger.warning("responses stream completed without response.completed")
-                return False
+                final_response = await stream.get_final_response()
+        except Exception:
+            logger.error(traceback.format_exc())
+            return False
+        body = final_response.model_dump(mode="json")
 
         try:
             structured = parse_response_json_text(body)
@@ -624,7 +614,6 @@ class MoeLlm:
                 try:
                     if self._use_responses_api():
                         result = await self.responses_llm_chat(
-                            session,
                             self.model_info["url"],
                             headers,
                             send_message_list,

@@ -16,8 +16,6 @@ build_image_reference = response_utils.build_image_reference
 detect_image_media_type = response_utils.detect_image_media_type
 extract_image_generation_calls = response_utils.extract_image_generation_calls
 extract_response_output_text = response_utils.extract_response_output_text
-is_image_generation_sse_event = response_utils.is_image_generation_sse_event
-parse_sse_event_chunk = response_utils.parse_sse_event_chunk
 parse_response_json_text = response_utils.parse_response_json_text
 replace_image_placeholders = response_utils.replace_image_placeholders
 
@@ -122,38 +120,6 @@ class ResponseUtilsTest(unittest.TestCase):
         self.assertEqual(
             extract_response_output_text(response),
             '{"assistant_reply":"","image_memories":[]}',
-        )
-
-    def test_parse_sse_event_chunk(self):
-        chunk = (
-            b'event: response.image_generation_call.in_progress\n'
-            b'data: {"type":"response.image_generation_call.in_progress","id":"img_123"}\n\n'
-        )
-        self.assertEqual(
-            parse_sse_event_chunk(chunk),
-            [
-                {
-                    "event": "response.image_generation_call.in_progress",
-                    "data": {
-                        "type": "response.image_generation_call.in_progress",
-                        "id": "img_123",
-                    },
-                }
-            ],
-        )
-
-    def test_is_image_generation_sse_event(self):
-        self.assertTrue(
-            is_image_generation_sse_event(
-                "response.image_generation_call.in_progress",
-                {"type": "response.image_generation_call.in_progress"},
-            )
-        )
-        self.assertFalse(
-            is_image_generation_sse_event(
-                "response.output_text.delta",
-                {"type": "response.output_text.delta"},
-            )
         )
 
     def test_detect_image_media_type_from_magic_bytes(self):

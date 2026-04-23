@@ -74,44 +74,6 @@ def extract_image_generation_calls(response: dict) -> list[dict]:
     return calls
 
 
-def parse_sse_event_chunk(chunk: bytes) -> list[dict]:
-    events = []
-    if not chunk:
-        return events
-
-    text = chunk.decode("utf-8", errors="ignore")
-    for block in text.split("\n\n"):
-        if not block.strip():
-            continue
-        event_name = None
-        data_lines = []
-        for line in block.splitlines():
-            if line.startswith("event:"):
-                event_name = line[6:].strip()
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].strip())
-        if not data_lines:
-            continue
-        data_text = "\n".join(data_lines).strip()
-        if not data_text or data_text == "[DONE]":
-            continue
-        try:
-            payload = json.loads(data_text)
-        except json.JSONDecodeError:
-            continue
-        events.append({"event": event_name, "data": payload})
-    return events
-
-
-def is_image_generation_sse_event(event_name: str | None, payload: dict) -> bool:
-    if event_name and "image_generation_call" in event_name:
-        return True
-    event_type = payload.get("type")
-    if isinstance(event_type, str) and "image_generation_call" in event_type:
-        return True
-    return False
-
-
 def parse_response_json_text(response: dict) -> dict:
     text = extract_response_output_text(response)
     if not text:
