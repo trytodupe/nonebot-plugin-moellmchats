@@ -24,7 +24,9 @@ from .response_utils import (
     detect_image_media_type,
     extract_image_generation_calls,
     extract_response_output_text,
+    is_image_generation_sse_event,
     normalize_image_summary,
+    parse_sse_event_chunk,
     parse_response_json_text,
     replace_image_placeholders,
 )
@@ -441,6 +443,7 @@ class MoeLlm:
             "instructions": self.prompt,
             "input": response_input,
             "text": text_payload,
+            "stream": True,
         }
         if max_tokens := self.model_info.get("max_tokens"):
             payload["max_output_tokens"] = max_tokens
@@ -465,9 +468,27 @@ class MoeLlm:
         ) as response:
             if error_msg := await self._check_400_error(response):
                 return error_msg
-            body = await response.json()
             if response.status != 200:
+                body = await response.json()
                 logger.warning(body)
+                return False
+            body = None
+            generation_notice_sent = False
+            async for chunk in response.content.iter_any():
+                for event in parse_sse_event_chunk(chunk):
+                    event_name = event.get("event")
+                    payload = event.get("data", {})
+                    if (
+                        native_image_generation
+                        and not generation_notice_sent
+                        and is_image_generation_sse_event(event_name, payload)
+                    ):
+                        await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
+                        generation_notice_sent = True
+                    if event_name == "response.completed":
+                        body = payload.get("response") or payload
+            if body is None:
+                logger.warning("responses stream completed without response.completed")
                 return False
 
         try:
@@ -478,7 +499,7 @@ class MoeLlm:
 
         image_calls = extract_image_generation_calls(body)
         assistant_reply = (structured.get("assistant_reply") or "").strip()
-        if not assistant_reply:
+        if not assistant_reply and not image_calls:
             assistant_reply = extract_response_output_text(body)
         if not assistant_reply and not image_calls:
             logger.warning(body)
