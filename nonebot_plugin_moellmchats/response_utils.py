@@ -85,11 +85,6 @@ def is_long_message(text: str) -> bool:
     return len(wrap_visual_lines(text)) > FORWARD_LINE_LIMIT
 
 
-def split_long_message(text: str, line_limit: int = FORWARD_LINE_LIMIT) -> list[str]:
-    lines = wrap_visual_lines(text)
-    return ["\n".join(lines[index : index + line_limit]) for index in range(0, len(lines), line_limit)]
-
-
 def extract_response_output_text(response: dict) -> str:
     for item in response.get("output", []):
         if item.get("type") != "message" or item.get("role") != "assistant":

@@ -26,7 +26,6 @@ from .response_utils import (
     is_long_message,
     normalize_image_summary,
     replace_image_placeholders,
-    split_long_message,
 )
 from .prompt_templates import build_group_chat_prompt
 
@@ -114,18 +113,16 @@ class MoeLlm:
             await self.bot.send(self.event, text)
             return
 
-        nodes = []
-        for chunk in split_long_message(text):
-            nodes.append(
-                {
-                    "type": "node",
-                    "data": {
-                        "name": "MoEllm",
-                        "uin": str(self.bot.self_id),
-                        "content": chunk,
-                    },
-                }
-            )
+        nodes = [
+            {
+                "type": "node",
+                "data": {
+                    "name": "MoEllm",
+                    "uin": str(self.bot.self_id),
+                    "content": text,
+                },
+            }
+        ]
         try:
             await self.bot.call_api(
                 "send_group_forward_msg",
