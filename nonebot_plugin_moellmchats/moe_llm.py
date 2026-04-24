@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+from pathlib import Path
 import traceback
 from asyncio import TimeoutError
 from collections import defaultdict, deque
@@ -13,6 +14,7 @@ from nonebot.log import logger
 from openai import AsyncOpenAI
 
 from .Config import config_parser
+from .ImageCache import image_cache
 from .ImageMemory import image_memory_store
 from .MessagesHandler import MessagesHandler
 from .ModelSelector import model_selector
@@ -21,8 +23,10 @@ from .response_utils import (
     detect_image_media_type,
     extract_image_generation_calls,
     extract_response_output_text,
+    is_long_message,
     normalize_image_summary,
     replace_image_placeholders,
+    split_long_message,
 )
 from .prompt_templates import build_group_chat_prompt
 
@@ -54,6 +58,8 @@ class MoeLlm:
         self.temperament = temperament
         self.model_info = {}
         self.prompt = BASE_PROMPT
+        self.fetched_images = []
+        self.fetch_recent_images_rounds = 0
 
     def _format_upstream_error(self, exc: Exception) -> str:
         message = str(exc).strip()
@@ -92,6 +98,9 @@ class MoeLlm:
     def _use_native_image_generation(self) -> bool:
         return bool(self.model_info.get("use_native_image_generation"))
 
+    def _supports_image_input(self) -> bool:
+        return bool(self.model_info.get("is_vision") or self._use_responses_api())
+
     def prompt_handler(self):
         recent_context = list(context_dict[self.event.group_id])[:-1]
         self.prompt = build_group_chat_prompt(
@@ -99,6 +108,33 @@ class MoeLlm:
             recent_context,
             instruction_profile="minimal",
         )
+
+    async def _send_text_response(self, text: str):
+        if not is_long_message(text) or not hasattr(self.event, "group_id"):
+            await self.bot.send(self.event, text)
+            return
+
+        nodes = []
+        for chunk in split_long_message(text):
+            nodes.append(
+                {
+                    "type": "node",
+                    "data": {
+                        "name": "MoEllm",
+                        "uin": str(self.bot.self_id),
+                        "content": chunk,
+                    },
+                }
+            )
+        try:
+            await self.bot.call_api(
+                "send_group_forward_msg",
+                group_id=self.event.group_id,
+                messages=nodes,
+            )
+        except Exception:
+            logger.error(traceback.format_exc())
+            await self.bot.send(self.event, text)
 
     async def stream_llm_chat(
         self, session, url, headers, data, proxy, is_segment=False
@@ -133,7 +169,7 @@ class MoeLlm:
             return False
         if not self.is_objective:
             self.messages_handler.post_process(result)
-        await self.bot.send(self.event, result)
+        await self._send_text_response(result)
         return True
 
     async def none_stream_llm_chat(self, session, url, headers, data, proxy) -> bool | str:
@@ -173,7 +209,7 @@ class MoeLlm:
             return False
         if not self.is_objective:
             self.messages_handler.post_process(result)
-        await self.bot.send(self.event, result)
+        await self._send_text_response(result)
         return True
 
     def _get_response_schema(self) -> dict:
@@ -208,15 +244,59 @@ class MoeLlm:
         *,
         native_web_search: bool = False,
         native_image_generation: bool = False,
+        local_image_cache: bool = False,
     ) -> tuple[list[dict], list[str]]:
         tools = []
         include = []
+        if local_image_cache:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "fetch_recent_images",
+                    "description": "Fetch recent QQ images cached by the plugin for the current user. Use this conservatively when the user asks to reference, edit, combine, redraw, or generate from recently sent images. Prefer fetching several images at once because QQ reply can attach only one image and the intended references may span multiple recent messages. If the fetched images do not include the intended references, call this tool again with a larger offset to fetch older cached images.",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Number of cached images to fetch. Prefer 4 to 8 when unsure, bounded by plugin configuration.",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "How many newest cached images to skip. Use 0 first. If the first batch is not enough, call again with offset equal to the number already inspected to fetch older images.",
+                            },
+                        },
+                        "required": ["limit", "offset"],
+                    },
+                    "strict": True,
+                }
+            )
         if native_web_search:
             tools.append({"type": "web_search"})
             include.append("web_search_call.action.sources")
         if native_image_generation:
             tools.append({"type": "image_generation"})
         return tools, include
+
+    def _extract_fetch_recent_images_args(self, response: dict) -> dict | None:
+        max_limit = int(config_parser.get_config("fetch_recent_images_max_limit") or 6)
+        default_limit = int(config_parser.get_config("fetch_recent_images_default_limit") or 3)
+        for item in response.get("output", []):
+            if item.get("type") != "function_call" or item.get("name") != "fetch_recent_images":
+                continue
+            arguments = item.get("arguments") or "{}"
+            try:
+                parsed = json.loads(arguments)
+            except ValueError:
+                parsed = {}
+            limit = parsed.get("limit") or default_limit
+            offset = parsed.get("offset") or 0
+            return {
+                "limit": max(1, min(int(limit), max_limit)),
+                "offset": max(0, int(offset)),
+            }
+        return None
 
     async def _send_generated_images(self, image_calls: list[dict]) -> int:
         sent_count = 0
@@ -233,28 +313,42 @@ class MoeLlm:
             sent_count += 1
         return sent_count
 
-    async def _prepare_current_images(self, session) -> list[dict]:
+    async def _prepare_images(
+        self,
+        session,
+        images: list[dict],
+        *,
+        include_known_images: bool = False,
+    ) -> list[dict]:
         prepared = []
         proxy = self.model_info.get("proxy")
-        for image in self.messages_handler.current_images:
-            source_url = image.get("source_url")
-            if not source_url:
-                continue
-            async with session.get(source_url, proxy=proxy, ssl=False) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"图片下载失败: {response.status}")
-                image_bytes = await response.read()
-                mime_type = detect_image_media_type(
-                    image_bytes, response.content_type
-                )
-                if not mime_type:
-                    raise RuntimeError("图片格式无法识别或当前不受支持")
+        for image in images:
+            image_bytes = None
+            mime_type = image.get("mime_type")
+            if file_path := image.get("file_path"):
+                path = Path(file_path)
+                if path.exists():
+                    image_bytes = path.read_bytes()
+                    mime_type = detect_image_media_type(image_bytes, mime_type)
+            if image_bytes is None:
+                source_url = image.get("source_url")
+                if not source_url:
+                    continue
+                async with session.get(source_url, proxy=proxy, ssl=False) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"图片下载失败: {response.status}")
+                    image_bytes = await response.read()
+                    mime_type = detect_image_media_type(
+                        image_bytes, response.content_type
+                    )
+            if not mime_type:
+                raise RuntimeError("图片格式无法识别或当前不受支持")
             digest = hashlib.sha256(image_bytes).hexdigest()
             image_id = f"img_sha256_{digest[:16]}"
             summary = image_memory_store.get_summary(image_id)
             image["image_id"] = image_id
             image["mime_type"] = mime_type
-            if summary:
+            if summary and not include_known_images:
                 image["summary"] = summary
                 prepared.append(
                     {
@@ -275,14 +369,55 @@ class MoeLlm:
             )
         return prepared
 
+    async def _prepare_current_images(self, session) -> list[dict]:
+        return await self._prepare_images(
+            session,
+            self.messages_handler.current_images,
+            include_known_images=self._use_native_image_generation(),
+        )
+
+    async def _build_fetched_image_content(self, session) -> list[dict]:
+        content = []
+        if not (self._supports_image_input() and self.fetched_images):
+            return content
+        prepared_images = await self._prepare_images(
+            session,
+            self.fetched_images,
+            include_known_images=True,
+        )
+        if prepared_images:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": "Images fetched from recent QQ cache for this turn.",
+                }
+            )
+        for image in prepared_images:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": f"Attachment for fetched recent image [image:{image['image_id']}]",
+                }
+            )
+            content.append({"type": "input_image", "image_url": image["data_url"]})
+        return content
+
     async def _build_responses_input(self, session, send_message_list: list[dict]) -> list[dict]:
         input_items = []
+        fetched_image_content = await self._build_fetched_image_content(session)
+        if fetched_image_content:
+            input_items.append(
+                {
+                    "role": "user",
+                    "content": fetched_image_content,
+                }
+            )
         for message in send_message_list[:-1]:
             input_items.append({"role": message["role"], "content": message["content"]})
 
         current_message = send_message_list[-1]
         current_text = current_message["content"]
-        if not (self.model_info.get("is_vision") and self.messages_handler.current_images):
+        if not (self._supports_image_input() and self.messages_handler.current_images):
             input_items.append({"role": "user", "content": current_text})
             return input_items
 
@@ -343,6 +478,7 @@ class MoeLlm:
         group_messages[-1] = {
             "speaker_name": sender_name,
             "content": self.messages_handler.new_user_msg["content"],
+            "images": self.messages_handler.current_images,
         }
 
     def _extract_stream_text_delta(self, event) -> str:
@@ -354,6 +490,65 @@ class MoeLlm:
             return text
         return ""
 
+    def _looks_like_recent_image_request(self) -> bool:
+        text = self.messages_handler.current_text
+        image_words = ("图", "图片", "照片", "脸", "logo", "p", "P", "生成", "合成", "参考", "照着", "换", "改")
+        reference_words = ("刚才", "最近", "上面", "前面", "后面", "前几张", "后几张", "这几张", "那几张")
+        return any(word in text for word in image_words) and any(word in text for word in reference_words)
+
+    def _prefetch_recent_images_if_needed(self):
+        if self.messages_handler.current_images or self.fetched_images:
+            return
+        if not self._looks_like_recent_image_request():
+            return
+        limit = int(config_parser.get_config("fetch_recent_images_default_limit") or 6)
+        max_limit = int(config_parser.get_config("fetch_recent_images_max_limit") or 10)
+        self.fetched_images = image_cache.get_recent_group_images(
+            group_id=self.event.group_id,
+            limit=max(1, min(limit, max_limit)),
+            offset=0,
+        )
+        if self.fetched_images:
+            logger.info(f"Prefetched {len(self.fetched_images)} recent cached images")
+
+    def _log_responses_summary(
+        self,
+        body: dict,
+        tools: list[dict],
+        event_counts: dict[str, int],
+        streamed_text_chars: int,
+    ):
+        output = body.get("output") or []
+        output_summary = []
+        for item in output:
+            summary = {"type": item.get("type")}
+            if item.get("type") == "function_call":
+                summary["name"] = item.get("name")
+                summary["arguments"] = item.get("arguments")
+            elif item.get("type") == "image_generation_call":
+                summary["id"] = item.get("id") or item.get("image_id")
+                summary["has_result"] = bool(item.get("result"))
+            elif item.get("type") == "message":
+                summary["role"] = item.get("role")
+                summary["content_types"] = [content.get("type") for content in item.get("content", [])]
+            output_summary.append(summary)
+        logger.info(
+            {
+                "event": "responses_summary",
+                "response_id": body.get("id"),
+                "status": body.get("status"),
+                "tools": [tool.get("name") or tool.get("type") for tool in tools],
+                "output": output_summary,
+                "usage": body.get("usage"),
+                "tool_usage": body.get("tool_usage"),
+                "event_counts": event_counts,
+                "streamed_text_chars": streamed_text_chars,
+                "output_text_chars": len(body.get("output_text") or ""),
+                "current_image_count": len(self.messages_handler.current_images),
+                "fetched_image_count": len(self.fetched_images),
+            }
+        )
+
     async def responses_llm_chat(
         self,
         url,
@@ -362,6 +557,7 @@ class MoeLlm:
         proxy,
         native_web_search=False,
         native_image_generation=False,
+        local_image_cache=False,
     ) -> bool | str:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300)
@@ -386,6 +582,7 @@ class MoeLlm:
         tools, include = self._build_responses_tools(
             native_web_search=native_web_search,
             native_image_generation=native_image_generation,
+            local_image_cache=local_image_cache,
         )
         if tools:
             payload["tools"] = tools
@@ -412,18 +609,31 @@ class MoeLlm:
         partial_image_calls = {}
         sent_stream_image_ids = set()
         sent_stream_image_count = 0
+        stream_event_counts = defaultdict(int)
+        streamed_function_calls = []
+        final_response = None
         try:
             async with client.responses.stream(**payload) as stream:
                 async for event in stream:
                     event_type = getattr(event, "type", "")
+                    stream_event_counts[event_type] += 1
                     if event_type == "response.output_text.delta":
                         if delta := self._extract_stream_text_delta(event):
                             streamed_text_chunks.append(delta)
                     elif event_type == "response.output_item.done":
                         item = getattr(event, "item", None)
-                        if (
+                        item_type = getattr(item, "type", "") if item is not None else ""
+                        if item_type == "function_call":
+                            streamed_function_calls.append(
+                                {
+                                    "type": "function_call",
+                                    "name": getattr(item, "name", None),
+                                    "arguments": getattr(item, "arguments", None),
+                                }
+                            )
+                        elif (
                             item is not None
-                            and getattr(item, "type", "") == "image_generation_call"
+                            and item_type == "image_generation_call"
                             and getattr(item, "result", None)
                         ):
                             item_id = getattr(item, "id", None) or f"output_{getattr(event, 'output_index', 0)}"
@@ -450,7 +660,19 @@ class MoeLlm:
                     ):
                         await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
                         generation_notice_sent = True
-                final_response = await stream.get_final_response()
+                try:
+                    final_response = await stream.get_final_response()
+                except RuntimeError as exc:
+                    if "response.completed" not in str(exc):
+                        raise
+                    logger.warning(
+                        {
+                            "event": "responses_stream_incomplete",
+                            "error": str(exc),
+                            "event_counts": dict(stream_event_counts),
+                            "function_calls": streamed_function_calls,
+                        }
+                    )
         except Exception as exc:
             logger.error(traceback.format_exc())
             if sent_stream_image_count > 0:
@@ -461,7 +683,43 @@ class MoeLlm:
             if http_client is not None:
                 await http_client.aclose()
 
-        body = final_response.model_dump(mode="json", warnings=False)
+        body = (
+            final_response.model_dump(mode="json", warnings=False)
+            if final_response is not None
+            else {"id": None, "status": "stream_incomplete", "output": streamed_function_calls}
+        )
+        self._log_responses_summary(
+            body,
+            tools,
+            dict(stream_event_counts),
+            sum(len(chunk) for chunk in streamed_text_chunks),
+        )
+        max_fetch_rounds = int(config_parser.get_config("fetch_recent_images_max_rounds") or 3)
+        if local_image_cache and self.fetch_recent_images_rounds < max_fetch_rounds:
+            fetch_args = self._extract_fetch_recent_images_args(body)
+            if fetch_args:
+                self.fetch_recent_images_rounds += 1
+                fetched_images = image_cache.get_recent_group_images(
+                    group_id=self.event.group_id,
+                    limit=fetch_args["limit"],
+                    offset=fetch_args["offset"],
+                )
+                known_image_ids = {image.get("image_id") for image in self.fetched_images}
+                self.fetched_images.extend(
+                    image
+                    for image in fetched_images
+                    if image.get("image_id") not in known_image_ids
+                )
+                if fetched_images:
+                    return await self.responses_llm_chat(
+                        url,
+                        headers,
+                        send_message_list,
+                        proxy,
+                        native_web_search=native_web_search,
+                        native_image_generation=native_image_generation,
+                        local_image_cache=True,
+                    )
         image_calls = extract_image_generation_calls(body)
         if not image_calls:
             image_calls = list(streamed_image_calls.values())
@@ -478,7 +736,7 @@ class MoeLlm:
             assistant_reply = extract_response_output_text(body)
 
         image_memories = []
-        output_text_obj = getattr(final_response, "output_text", None)
+        output_text_obj = getattr(final_response, "output_text", None) if final_response is not None else None
         if output_text_obj and isinstance(output_text_obj, str):
             try:
                 parsed = json.loads(output_text_obj)
@@ -495,9 +753,10 @@ class MoeLlm:
                 assistant_reply = (parsed.get("assistant_reply") or "").strip()
                 image_memories = parsed.get("image_memories") or []
 
-        if not assistant_reply and not image_calls:
-            logger.warning(body)
-            return False
+        if not assistant_reply and not image_calls and sent_stream_image_count == 0:
+            if self.fetched_images and self._looks_like_recent_image_request():
+                return f"这轮模型没返回文本或图片；我这边只取到了 {len(self.fetched_images)} 张群缓存图。"
+            return "这轮模型没有返回内容。"
 
         self._apply_image_memory_updates(image_memories)
         self._sync_group_context_with_current_user_message()
@@ -506,9 +765,8 @@ class MoeLlm:
 
         sent_images = sent_stream_image_count + await self._send_generated_images(image_calls)
         if assistant_reply:
-            await self.bot.send(self.event, assistant_reply)
+            await self._send_text_response(assistant_reply)
         elif sent_images == 0:
-            logger.warning(body)
             return False
         return True
 
@@ -522,6 +780,8 @@ class MoeLlm:
         logger.info(f"模型选择为：{self.model_info['model']}")
         self.prompt_handler()
         send_message_list = self.messages_handler.get_send_message_list()
+
+        self._prefetch_recent_images_if_needed()
 
         use_native_web_search = (
             model_selector.get_web_search() and self._use_native_web_search()
@@ -573,6 +833,7 @@ class MoeLlm:
                         self.model_info.get("proxy"),
                         native_web_search=use_native_web_search,
                         native_image_generation=use_native_image_generation,
+                        local_image_cache=True,
                     )
                 if self.model_info.get("stream"):
                     return await self.stream_llm_chat(
@@ -595,6 +856,15 @@ class MoeLlm:
             except TimeoutError:
                 return "请求超时。"
             except Exception as exc:
-                logger.warning(str(send_message_list))
+                logger.warning(
+                    {
+                        "event": "llm_request_failed",
+                        "model": self.model_info.get("model"),
+                        "use_responses_api": self._use_responses_api(),
+                        "message_count": len(send_message_list),
+                        "current_image_count": len(self.messages_handler.current_images),
+                        "fetched_image_count": len(self.fetched_images),
+                    }
+                )
                 logger.error(traceback.format_exc())
                 return self._format_upstream_error(exc)

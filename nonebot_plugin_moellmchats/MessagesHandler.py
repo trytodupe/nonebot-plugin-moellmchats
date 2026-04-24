@@ -1,7 +1,7 @@
 from collections import defaultdict, deque
 import time
 from .Config import config_parser
-from .response_utils import build_image_reference, replace_image_placeholders
+from .response_utils import format_text_with_image_context
 
 messages_dict = defaultdict(
     lambda: deque(maxlen=config_parser.get_config("max_user_history"))
@@ -92,15 +92,8 @@ class MessagesHandler:
         if not self.current_images:
             return
 
-        replacements = []
-        for image in self.current_images:
-            if summary := image.get("summary"):
-                replacements.append(build_image_reference(summary))
-            else:
-                replacements.append("[image]")
-
-        self.new_user_msg["content"] = replace_image_placeholders(
-            self.current_text, replacements
+        self.new_user_msg["content"] = format_text_with_image_context(
+            self.current_text, self.current_images
         )
 
     # 后处理

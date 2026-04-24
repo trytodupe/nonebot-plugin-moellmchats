@@ -1,4 +1,8 @@
 import json
+import unicodedata
+
+VISUAL_LINE_WIDTH = 62.0
+FORWARD_LINE_LIMIT = 45
 
 
 def normalize_image_summary(summary: str) -> str:
@@ -27,6 +31,63 @@ def replace_image_placeholders(
     if len(replacements) + 1 < len(parts):
         result.extend(parts[len(replacements) + 1 :])
     return "".join(result)
+
+
+def build_image_context_replacements(images: list[dict]) -> list[str]:
+    replacements = []
+    for image in images:
+        if summary := image.get("summary"):
+            replacements.append(build_image_reference(summary))
+        else:
+            replacements.append("[image]")
+    return replacements
+
+
+def format_text_with_image_context(text: str, images: list[dict]) -> str:
+    return replace_image_placeholders(text, build_image_context_replacements(images))
+
+
+def _char_visual_width(char: str) -> float:
+    if char == "\n":
+        return VISUAL_LINE_WIDTH
+    if unicodedata.east_asian_width(char) in {"F", "W"}:
+        return VISUAL_LINE_WIDTH / 15
+    if char in "ilI.,'`|![](){}:; ":
+        return 1.0
+    if char.isascii():
+        return VISUAL_LINE_WIDTH / 27
+    return VISUAL_LINE_WIDTH / 20
+
+
+def wrap_visual_lines(text: str, line_width: float = VISUAL_LINE_WIDTH) -> list[str]:
+    lines = []
+    current = []
+    current_width = 0.0
+    for char in text:
+        if char == "\n":
+            lines.append("".join(current))
+            current = []
+            current_width = 0.0
+            continue
+        char_width = _char_visual_width(char)
+        if current and current_width + char_width > line_width:
+            lines.append("".join(current))
+            current = [char]
+            current_width = char_width
+        else:
+            current.append(char)
+            current_width += char_width
+    lines.append("".join(current))
+    return lines
+
+
+def is_long_message(text: str) -> bool:
+    return len(wrap_visual_lines(text)) > FORWARD_LINE_LIMIT
+
+
+def split_long_message(text: str, line_limit: int = FORWARD_LINE_LIMIT) -> list[str]:
+    lines = wrap_visual_lines(text)
+    return ["\n".join(lines[index : index + line_limit]) for index in range(0, len(lines), line_limit)]
 
 
 def extract_response_output_text(response: dict) -> str:

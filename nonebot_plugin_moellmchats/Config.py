@@ -30,6 +30,11 @@ class ConfigParser:
                 "emotions_enabled": False,
                 "emotion_rate": 0.1,
                 "emotions_dir": "absolute path",
+                "image_cache_max_records_per_user": 20,
+                "image_cache_expire_seconds": 3600,
+                "fetch_recent_images_default_limit": 6,
+                "fetch_recent_images_max_limit": 10,
+                "fetch_recent_images_max_rounds": 3,
             }
             with open(self.filepath, "w", encoding="utf-8") as file:
                 json.dump(config, file, indent=4, ensure_ascii=False)
