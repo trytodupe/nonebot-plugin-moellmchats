@@ -117,7 +117,7 @@ class MoeLlm:
             {
                 "type": "node",
                 "data": {
-                    "name": "MoEllm",
+                    "name": "OwO",
                     "uin": str(self.bot.self_id),
                     "content": text,
                 },
