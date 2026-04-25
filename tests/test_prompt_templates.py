@@ -136,6 +136,22 @@ class PromptTemplatesTest(unittest.TestCase):
         self.assertNotIn("顺手接一句", prompt)
         self.assertNotIn("优先回态度、吐槽、短判断", prompt)
 
+    def test_build_group_chat_prompt_contains_creative_image_safety_rules(self):
+        prompt = build_group_chat_prompt(
+            "base persona",
+            [],
+            instruction_profile="minimal",
+        )
+
+        self.assertIn("图片生成/编辑的安全边界", prompt)
+        self.assertIn("默认允许创意、虚构、恶搞、讽刺", prompt)
+        self.assertIn("虚构/整活的群聊禁言截图", prompt)
+        self.assertIn("99999", prompt)
+        self.assertIn("公众人物或名人的品牌风格恶搞", prompt)
+        self.assertIn("历史或政治争议人物的非美化荒诞梗图", prompt)
+        self.assertIn("判断依据是意图和现实伤害，不是敏感元素本身", prompt)
+        self.assertIn("伪造真实商业代言或官方广告并希望别人信以为真", prompt)
+
     def test_build_group_chat_prompt_rejects_unknown_instruction_profile(self):
         with self.assertRaises(ValueError):
             build_group_chat_prompt(
