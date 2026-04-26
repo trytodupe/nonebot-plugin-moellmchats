@@ -74,9 +74,16 @@ async def handle_llm(
     if remaining > 0:
         sender_name = event.sender.card or event.sender.nickname
         notice = f"{sender_name} 的上一轮请求仍在处理中，约 {remaining} 秒后继续。"
+        llm_sender = llm.MoeLlm(
+            bot,
+            event,
+            format_message_dict,
+        )
         if is_repeat_ask_dict[user_id]:
-            await matcher.finish(notice)
-        await matcher.send(notice)
+            await llm_sender.send_reply_message(notice)
+            await matcher.finish()
+            return
+        await llm_sender.send_reply_message(notice)
         is_repeat_ask_dict[user_id] = True
         await asyncio.sleep(max(0, remaining))
 
@@ -90,7 +97,9 @@ async def handle_llm(
     is_repeat_ask_dict[user_id] = False
     if isinstance(result, str):
         cd[user_id] = 0
-        await matcher.finish(result)
+        await llm_chat.send_reply_message(result)
+        await matcher.finish()
+        return
     elif not result:
         cd[user_id] = 0
 

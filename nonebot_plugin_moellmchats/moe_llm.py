@@ -35,6 +35,8 @@ context_dict = defaultdict(
     lambda: deque(maxlen=config_parser.get_config("max_group_history"))
 )
 
+IMAGE_GENERATION_NOTICE_EMOJI_ID = 10024
+
 BASE_PROMPT = (
     "你在 QQ 群聊里回复当前用户的最新一条消息。"
     "目标是自然接话并把该说的信息说到位。"
@@ -83,6 +85,40 @@ class MoeLlm:
         self.image_inputs_by_id = {}
         self.imagegen_instructions_provided = False
         self.generation_notice_sent = False
+
+    def _reply_segment(self):
+        if message_id := getattr(self.event, "message_id", None):
+            return MessageSegment.reply(message_id)
+        return None
+
+    def build_reply_message(self, content) -> MessageSegment | str:
+        reply_segment = self._reply_segment()
+        if reply_segment is None:
+            return content
+        if isinstance(content, MessageSegment):
+            return reply_segment + content
+        return reply_segment + MessageSegment.text(str(content))
+
+    async def send_reply_message(self, content):
+        await self.bot.send(self.event, self.build_reply_message(content))
+
+    async def send_generation_notice_event_once(self):
+        if self.generation_notice_sent:
+            return
+        message_id = getattr(self.event, "message_id", None)
+        if not message_id:
+            self.generation_notice_sent = True
+            return
+        try:
+            await self.bot.call_api(
+                "set_msg_emoji_like",
+                message_id=message_id,
+                emoji_id=IMAGE_GENERATION_NOTICE_EMOJI_ID,
+            )
+        except Exception:
+            logger.warning("Failed to send image-generation emoji-like event", exc_info=True)
+        finally:
+            self.generation_notice_sent = True
 
     def _format_upstream_error(self, exc: Exception) -> str:
         message = str(exc).strip()
@@ -164,7 +200,7 @@ class MoeLlm:
 
     async def _send_text_response(self, text: str):
         if not is_long_message(text) or not hasattr(self.event, "group_id"):
-            await self.bot.send(self.event, text)
+            await self.send_reply_message(text)
             return
 
         nodes = [
@@ -185,7 +221,7 @@ class MoeLlm:
             )
         except Exception:
             logger.error(traceback.format_exc())
-            await self.bot.send(self.event, text)
+            await self.send_reply_message(text)
 
     async def stream_llm_chat(
         self, session, url, headers, data, proxy, is_segment=False
@@ -573,7 +609,7 @@ class MoeLlm:
                     if image_response.status == 200:
                         image_bytes = await image_response.read()
             if image_bytes:
-                await self.bot.send(self.event, MessageSegment.image(image_bytes))
+                await self.send_reply_message(MessageSegment.image(image_bytes))
                 sent_count += 1
         return sent_count
 
@@ -705,7 +741,7 @@ class MoeLlm:
             except Exception:
                 logger.warning("Failed to decode generated image")
                 continue
-            await self.bot.send(self.event, MessageSegment.image(image_bytes))
+            await self.send_reply_message(MessageSegment.image(image_bytes))
             sent_count += 1
         return sent_count
 
@@ -1080,12 +1116,6 @@ class MoeLlm:
         final_response = None
         stream_started_at = time.monotonic()
 
-        async def send_generation_notice_once():
-            if self.generation_notice_sent:
-                return
-            await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
-            self.generation_notice_sent = True
-
         def log_generation_candidate_event(event, event_type: str):
             item = getattr(event, "item", None)
             item_type = getattr(item, "type", None) if item is not None else None
@@ -1124,7 +1154,7 @@ class MoeLlm:
                         item = getattr(event, "item", None)
                         item_type = getattr(item, "type", "") if item is not None else ""
                         if item_type == "image_generation_call":
-                            await send_generation_notice_once()
+                            await self.send_generation_notice_event_once()
                     elif event_type == "response.output_item.done":
                         item = getattr(event, "item", None)
                         item_type = getattr(item, "type", "") if item is not None else ""
@@ -1138,7 +1168,7 @@ class MoeLlm:
                                 }
                             )
                             if function_name == "get_imagegen_instructions":
-                                await send_generation_notice_once()
+                                await self.send_generation_notice_event_once()
                         elif (
                             item is not None
                             and item_type == "image_generation_call"
@@ -1165,7 +1195,7 @@ class MoeLlm:
                         not self.generation_notice_sent
                         and "image_generation_call" in event_type
                     ):
-                        await send_generation_notice_once()
+                        await self.send_generation_notice_event_once()
                 try:
                     final_response = await stream.get_final_response()
                 except RuntimeError as exc:
@@ -1206,7 +1236,7 @@ class MoeLlm:
             and self._extract_function_args(body, "get_imagegen_instructions")
         )
         if rerun_with_imagegen_instructions:
-            await send_generation_notice_once()
+            await self.send_generation_notice_event_once()
             self.imagegen_instructions_provided = True
         avatar_args = self._extract_function_args(body, "fetch_user_avatar")
         known_avatar_refs = {
@@ -1270,7 +1300,7 @@ class MoeLlm:
         edit_image_args = self._extract_image_edit_args(body)
         external_sent_images = 0
         if generate_image_args or edit_image_args:
-            await self.bot.send(self.event, "正在生成图像，需要2-3分钟...")
+            await self.send_generation_notice_event_once()
         if edit_image_args:
             edited = await self._edit_external_images(edit_image_args)
             if isinstance(edited, str):

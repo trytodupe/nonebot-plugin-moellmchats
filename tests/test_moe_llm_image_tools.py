@@ -23,14 +23,47 @@ spec = spec_from_file_location(
 moe_llm = module_from_spec(spec)
 assert spec.loader is not None
 
+class FakeMessage:
+    def __init__(self, segments=None):
+        self.segments = list(segments or [])
+
+    def __add__(self, other):
+        if isinstance(other, FakeMessage):
+            return FakeMessage(self.segments + other.segments)
+        return FakeMessage(self.segments + [other])
+
+
+class FakeMessageSegment:
+    def __init__(self, seg_type, data):
+        self.type = seg_type
+        self.data = data
+
+    def __add__(self, other):
+        if isinstance(other, FakeMessage):
+            return FakeMessage([self] + other.segments)
+        return FakeMessage([self, other])
+
+    @staticmethod
+    def reply(message_id):
+        return FakeMessageSegment("reply", {"id": message_id})
+
+    @staticmethod
+    def text(text):
+        return FakeMessageSegment("text", {"text": text})
+
+    @staticmethod
+    def image(file):
+        return FakeMessageSegment("image", {"file": file})
+
+
 with patch.dict(
     "sys.modules",
     {
         "aiohttp": SimpleNamespace(),
         "httpx": SimpleNamespace(),
         "nonebot": SimpleNamespace(),
-        "nonebot.adapters.onebot.v11": SimpleNamespace(MessageSegment=SimpleNamespace()),
-        "nonebot.log": SimpleNamespace(logger=SimpleNamespace()),
+        "nonebot.adapters.onebot.v11": SimpleNamespace(MessageSegment=FakeMessageSegment),
+        "nonebot.log": SimpleNamespace(logger=SimpleNamespace(warning=SimpleNamespace(), info=SimpleNamespace(), error=SimpleNamespace())),
         "nonebot_plugin_localstore": SimpleNamespace(
             get_plugin_config_dir=lambda: Path("/tmp/moellmchats-test-config"),
             get_plugin_data_dir=lambda: Path("/tmp/moellmchats-test-data"),
@@ -50,7 +83,7 @@ class MoeLlmImageToolsTest(unittest.TestCase):
     def build_llm(self):
         llm = MoeLlm(
             bot=SimpleNamespace(),
-            event=SimpleNamespace(user_id=1, group_id=2),
+            event=SimpleNamespace(user_id=1, group_id=2, message_id=42),
             format_message_dict={},
         )
         llm.messages_handler = SimpleNamespace(user_refs=[])
@@ -196,6 +229,60 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertTrue(llm._is_redundant_image_completion_reply("好了。"))
         self.assertTrue(llm._is_redundant_image_completion_reply("done"))
         self.assertFalse(llm._is_redundant_image_completion_reply("这张图里保留了原本的水彩画风。"))
+
+    def test_build_reply_message_prefixes_reply_segment_without_at(self):
+        llm = self.build_llm()
+
+        message = llm.build_reply_message("hello")
+
+        self.assertIsInstance(message, FakeMessage)
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in message.segments],
+            [
+                ("reply", {"id": 42}),
+                ("text", {"text": "hello"}),
+            ],
+        )
+
+    def test_send_generation_notice_event_once(self):
+        bot = SimpleNamespace(call_api=AsyncMock())
+        llm = MoeLlm(
+            bot=bot,
+            event=SimpleNamespace(user_id=1, group_id=2, message_id=42),
+            format_message_dict={},
+        )
+        llm.messages_handler = SimpleNamespace(user_refs=[])
+
+        asyncio.run(llm.send_generation_notice_event_once())
+        asyncio.run(llm.send_generation_notice_event_once())
+
+        bot.call_api.assert_awaited_once_with(
+            "set_msg_emoji_like",
+            message_id=42,
+            emoji_id=moe_llm.IMAGE_GENERATION_NOTICE_EMOJI_ID,
+        )
+
+    def test_send_reply_message_wraps_image_with_reply_segment(self):
+        bot = SimpleNamespace(send=AsyncMock())
+        llm = MoeLlm(
+            bot=bot,
+            event=SimpleNamespace(user_id=1, group_id=2, message_id=42),
+            format_message_dict={},
+        )
+        llm.messages_handler = SimpleNamespace(user_refs=[])
+
+        asyncio.run(llm.send_reply_message(FakeMessageSegment.image(b"img")))
+
+        bot.send.assert_awaited_once()
+        sent_event, sent_message = bot.send.await_args.args
+        self.assertEqual(sent_event.message_id, 42)
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in sent_message.segments],
+            [
+                ("reply", {"id": 42}),
+                ("image", {"file": b"img"}),
+            ],
+        )
 
 
 if __name__ == "__main__":
