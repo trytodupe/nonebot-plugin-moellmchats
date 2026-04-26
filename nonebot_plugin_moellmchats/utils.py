@@ -8,6 +8,18 @@ async def format_message(event, bot) -> dict:
     text_message = []
     reply_text = ""
     image_urls = []
+    user_refs = []
+    mentioned_user_index = 0
+
+    sender_name = event.sender.card or event.sender.nickname or str(event.user_id)
+    user_refs.append(
+        {
+            "ref": "current_user",
+            "display_name": str(sender_name),
+            "relation": "current_speaker",
+            "user_id": str(event.user_id),
+        }
+    )
 
     # 1. 处理回复消息中的图片 (使用你提供的逻辑)
     if reply := event.reply:
@@ -49,7 +61,17 @@ async def format_message(event, bot) -> dict:
             qq = msgseg.data.get("qq")
             if qq != nonebot.get_bot().self_id:
                 name = await get_member_name(event.group_id, qq, bot)
-                text_message.append(name)
+                mentioned_user_index += 1
+                ref = f"mentioned_user_{mentioned_user_index}"
+                user_refs.append(
+                    {
+                        "ref": ref,
+                        "display_name": name,
+                        "relation": "mentioned_user",
+                        "user_id": str(qq),
+                    }
+                )
+                text_message.append(f"{name}({ref})")
         elif msgseg.type == "image":
             text_message.append("[图片]")
             if url := msgseg.data.get("url"):
@@ -60,7 +82,7 @@ async def format_message(event, bot) -> dict:
             if plain := msgseg.data.get("text", ""):
                 text_message.append(plain)
 
-    return {"text": text_message, "reply": reply_text, "images": image_urls}
+    return {"text": text_message, "reply": reply_text, "images": image_urls, "user_refs": user_refs}
 
 
 async def get_member_name(group: int, sender_id: int, bot) -> str:  # 将QQ号转换成昵称

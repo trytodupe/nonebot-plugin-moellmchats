@@ -207,14 +207,21 @@ your_absolute_path/
     "is_vision": true, // 开启多模态识图能力（仅当模型支持视觉时开启）
     "stream": true
   },
-  "gpt-5-mini-responses": {
-    "url": "http://127.0.0.1:4141/v1/responses",
-    "key": "Bearer dummy",
-    "model": "gpt-5-mini",
+  "gpt-5.4-mini-responses": {
+    "url": "https://api.openai.com/v1/responses",
+    "key": "Bearer sk-xxx",
+    "model": "gpt-5.4-mini",
     "api_style": "responses", // 使用 Responses API
     "is_vision": true,
     "use_native_web_search": true, // 开启后，插件会使用 OpenAI 原生 web_search tool，而不是 Tavily
-    "use_native_image_generation": false, // 开启后，模型可在 Responses 对话中自行决定是否调用原生 image_generation tool
+    "use_external_image_generation": true, // 开启后，插件会让模型调用外部图片生成/编辑函数，而不是 Responses 原生 image_generation tool
+    "external_image_generation": {
+      "generation_url": "https://api.jucode.cn/v1/images/generations",
+      "edit_url": "https://api.jucode.cn/v1/images/edits",
+      "model": "gpt-image-2",
+      "api_key_env": "CODEX_API_KEY",
+      "size": "1024x1024"
+    },
     "reasoning_effort": "low",
     "verbosity": "low" // 可选：low / medium / high，群聊场景建议 low
   }
@@ -225,7 +232,8 @@ your_absolute_path/
 
 - `api_style`: `chat_completions` 或 `responses`。当设置为 `responses` 时，插件会改走 Responses API。
 - `use_native_web_search`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，并且总开关 `use_web_search = true`，插件将使用模型原生 `web_search` tool。
-- `use_native_image_generation`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，插件会把原生 `image_generation` tool 暴露给模型，由模型在对话中自行决定是否调用。
+- `use_external_image_generation`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，插件会暴露 `get_imagegen_instructions`、`image_generation` 和 `image_edit` 函数给模型。模型先获取 `$imagegen` 风格的 prompt 细化规则，再自行决定调用生成或编辑。
+- `external_image_generation`: 外部图片 API 配置。`generation_url` 默认为 `https://api.jucode.cn/v1/images/generations`，`edit_url` 默认由生成地址替换为 `/v1/images/edits`，`model` 默认为 `gpt-image-2`，`api_key_env` 默认为 `CODEX_API_KEY`。兼容旧的 `url` 字段作为生成地址。API key 只从环境变量读取，不要写进配置文件。
 - `reasoning_effort`: 可选，透传给 Responses API 的 `reasoning.effort`。
 - `verbosity`: 可选，仅在 `api_style = "responses"` 时生效，透传给 Responses API 的 `text.verbosity`。群聊回复若嫌太像标准答案，建议设为 `low`。
 

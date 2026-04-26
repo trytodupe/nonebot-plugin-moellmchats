@@ -47,13 +47,20 @@ class ModelSelector:
                     "top_k": 5,
                     "top_p": 1.0,
                 },
-                "gpt-5.4-responses": {
+                "gpt-5.4-mini-responses": {
                     "url": "https://api.openai.com/v1/responses",
                     "key": "Bearer sk-xxx",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.4-mini",
                     "api_style": "responses",
                     "use_native_web_search": True,
-                    "use_native_image_generation": True,
+                    "use_external_image_generation": True,
+                    "external_image_generation": {
+                        "generation_url": "https://api.jucode.cn/v1/images/generations",
+                        "edit_url": "https://api.jucode.cn/v1/images/edits",
+                        "model": "gpt-image-2",
+                        "api_key_env": "CODEX_API_KEY",
+                        "size": "1024x1024",
+                    },
                     "reasoning_effort": "low",
                     "verbosity": "low",
                 },
