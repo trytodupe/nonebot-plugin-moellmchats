@@ -109,6 +109,16 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertNotIn("image_generation", tool_names)
         self.assertNotIn("image_edit", tool_names)
 
+    def test_builds_chat_tools(self):
+        llm = self.build_llm()
+        tools = llm._build_chat_tools(external_image_generation=True, local_image_cache=True)
+        tool_names = [tool.get("name") or tool.get("type") for tool in tools]
+
+        self.assertIn("fetch_recent_images", tool_names)
+        self.assertIn("get_imagegen_instructions", tool_names)
+        self.assertIn("image_generation", tool_names)
+        self.assertIn("image_edit", tool_names)
+
     def test_extracts_generation_and_legacy_generate_image_args(self):
         llm = self.build_llm()
         response = {
@@ -151,6 +161,55 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertEqual(
             llm._extract_function_args(merged, "get_imagegen_instructions"),
             [{}],
+        )
+
+    def test_extracts_chat_tool_calls(self):
+        llm = self.build_llm()
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_imagegen_instructions",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(
+            llm._extract_chat_tool_calls(response),
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "name": "get_imagegen_instructions",
+                    "arguments": "{}",
+                }
+            ],
+        )
+
+    def test_converts_responses_content_to_chat(self):
+        llm = self.build_llm()
+
+        self.assertEqual(
+            llm._convert_responses_content_to_chat(
+                [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                ]
+            ),
+            [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
         )
 
     def test_does_not_duplicate_streamed_function_calls(self):
@@ -214,6 +273,21 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             llm._image_edit_url(),
             "https://api.example.com/v1/images/edits",
         )
+
+    def test_handle_chat_tool_calls_marks_instruction_rerun(self):
+        llm = self.build_llm()
+
+        rerun_requested, sent_images = asyncio.run(
+            llm._handle_chat_tool_calls(
+                [{"id": "call_1", "type": "function", "name": "get_imagegen_instructions", "arguments": "{}"}],
+                external_image_generation=False,
+                local_image_cache=False,
+            )
+        )
+
+        self.assertTrue(rerun_requested)
+        self.assertEqual(sent_images, 0)
+        self.assertTrue(llm.imagegen_instructions_provided)
 
     def test_preserves_upstream_image_api_error_body(self):
         llm = self.build_llm()

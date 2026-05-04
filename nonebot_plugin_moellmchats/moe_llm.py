@@ -497,6 +497,135 @@ class MoeLlm:
             )
         return tools, include
 
+    def _build_chat_tools(
+        self,
+        *,
+        external_image_generation: bool = False,
+        local_image_cache: bool = False,
+    ) -> list[dict]:
+        tools = []
+        if local_image_cache:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "fetch_recent_images",
+                    "description": "Fetch recent QQ images cached by the plugin for the current user. Use this conservatively when the user asks to reference, edit, combine, redraw, or generate from recently sent images. Prefer fetching several images at once because QQ reply can attach only one image and the intended references may span multiple recent messages. If the fetched images do not include the intended references, call this tool again with a larger offset to fetch older cached images.",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Number of cached images to fetch. Prefer 4 to 8 when unsure, bounded by plugin configuration.",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "How many newest cached images to skip. Use 0 first. If the first batch is not enough, call again with offset equal to the number already inspected to fetch older cached images.",
+                            },
+                        },
+                        "required": ["limit", "offset"],
+                    },
+                    "strict": True,
+                }
+            )
+        if self.messages_handler.user_refs:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "fetch_user_avatar",
+                    "description": "Fetch a QQ user's avatar for this turn by temporary user_ref, never by QQ number. Use when the user asks to generate an image containing themselves or a mentioned user, or asks what they / a mentioned user look like as a person. Use current_user for 'me' and mentioned_user_N for mentioned users.",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "user_ref": {
+                                "type": "string",
+                                "description": "Temporary user reference from this turn, such as current_user or mentioned_user_1.",
+                            }
+                        },
+                        "required": ["user_ref"],
+                    },
+                    "strict": True,
+                }
+            )
+        tools.append(
+            {
+                "type": "function",
+                "name": "get_imagegen_instructions",
+                "description": "Return the $imagegen prompt-refinement instructions. Call this before using any image generation/editing tool unless the same instructions were already fetched in this turn.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {},
+                    "required": [],
+                },
+                "strict": True,
+            }
+        )
+        if external_image_generation:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "image_generation",
+                    "description": "POST /v1/images/generations. Generate a new image with an external image generation service. " + IMAGEGEN_TOOL_DESCRIPTION,
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Complete standalone prompt for the image generator, including style, composition, text to render, and any needed non-private visual references.",
+                            },
+                            "size": {
+                                "type": "string",
+                                "enum": ["1024x1024", "1024x1536", "1536x1024"],
+                                "description": "Output size. Use 1024x1024 by default; portrait posters usually use 1024x1536; landscape banners use 1536x1024.",
+                            },
+                            "n": {
+                                "type": "integer",
+                                "description": "Number of images to generate, normally 1.",
+                            },
+                        },
+                        "required": ["prompt", "size", "n"],
+                    },
+                    "strict": True,
+                }
+            )
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "image_edit",
+                    "description": "POST /v1/images/edits. Edit one or more existing images with an external image generation service. Use this when the user asks to modify, redraw, restyle, compose, or use images/avatars as visual references. " + IMAGEGEN_TOOL_DESCRIPTION,
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Complete standalone edit prompt. State what to change and what must remain unchanged.",
+                            },
+                            "image_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Image IDs to send to the image edit API. Use IDs from current attachments, fetched recent images, or fetched avatars. Include 1 to 16 images.",
+                            },
+                            "size": {
+                                "type": "string",
+                                "enum": ["1024x1024", "1024x1536", "1536x1024"],
+                                "description": "Output size. Use 1024x1024 by default; portrait posters usually use 1024x1536; landscape banners use 1536x1024.",
+                            },
+                            "n": {
+                                "type": "integer",
+                                "description": "Number of edited images to return, normally 1.",
+                            },
+                        },
+                        "required": ["prompt", "image_ids", "size", "n"],
+                    },
+                    "strict": True,
+                }
+            )
+        return tools
+
     def _extract_function_args(self, response: dict, function_name: str) -> list[dict]:
         args_list = []
         for item in response.get("output", []):
@@ -579,6 +708,118 @@ class MoeLlm:
                 }
             )
         return args_list
+
+    def _extract_chat_tool_calls(self, response: dict) -> list[dict]:
+        choices = response.get("choices") or []
+        if not choices:
+            return []
+        message = choices[0].get("message") or {}
+        tool_calls = message.get("tool_calls") or []
+        parsed_tool_calls = []
+        for index, item in enumerate(tool_calls):
+            function = item.get("function") or {}
+            name = function.get("name")
+            if not name:
+                continue
+            parsed_tool_calls.append(
+                {
+                    "id": item.get("id") or f"chat_tool_call_{index}",
+                    "type": "function",
+                    "name": name,
+                    "arguments": function.get("arguments") or "{}",
+                }
+            )
+        function_call = message.get("function_call") or {}
+        if function_call and not parsed_tool_calls:
+            name = function_call.get("name")
+            if name:
+                parsed_tool_calls.append(
+                    {
+                        "id": "chat_tool_call_0",
+                        "type": "function",
+                        "name": name,
+                        "arguments": function_call.get("arguments") or "{}",
+                    }
+                )
+        return parsed_tool_calls
+
+    def _merge_streamed_chat_tool_calls(self, response: dict, streamed_tool_calls: list[dict]) -> dict:
+        if not streamed_tool_calls:
+            return response
+        choices = response.setdefault("choices", [])
+        if not choices:
+            choices.append({"message": {"role": "assistant"}})
+        message = choices[0].setdefault("message", {})
+        existing_tool_calls = {
+            (
+                item.get("id"),
+                (item.get("function") or {}).get("name"),
+                (item.get("function") or {}).get("arguments"),
+            )
+            for item in message.get("tool_calls") or []
+        }
+        tool_calls = message.setdefault("tool_calls", [])
+        for item in streamed_tool_calls:
+            key = (
+                item.get("id"),
+                item.get("name"),
+                item.get("arguments"),
+            )
+            if key in existing_tool_calls:
+                continue
+            tool_calls.append(
+                {
+                    "id": item.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments"),
+                    },
+                }
+            )
+            existing_tool_calls.add(key)
+        return response
+
+    def _convert_responses_content_to_chat(self, content):
+        if not isinstance(content, list):
+            return content
+        converted = []
+        for item in content:
+            item_type = item.get("type")
+            if item_type == "input_text":
+                converted.append({"type": "text", "text": item.get("text", "")})
+            elif item_type == "input_image":
+                converted.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": item.get("image_url")},
+                    }
+                )
+        return converted
+
+    async def _build_chat_messages(self, session, send_message_list: list[dict]) -> list[dict]:
+        response_input = await self._build_responses_input(session, send_message_list)
+        return [
+            {
+                "role": item["role"],
+                "content": self._convert_responses_content_to_chat(item["content"]),
+            }
+            for item in response_input
+        ]
+
+    def _strip_think_tags(self, content: str) -> str:
+        start_tag = "<think>"
+        end_tag = "</think>"
+        start = content.find(start_tag)
+        end = content.find(end_tag)
+        if start == -1 and end != -1:
+            end += len(end_tag)
+            start = 0
+            return content[:start] + content[end:]
+        if start != -1 and end != -1:
+            end += len(end_tag)
+            return content[:start] + content[end:]
+        return content
 
     def _image_api_headers(self, api_key: str, *, multipart: bool = False) -> dict[str, str]:
         headers = {
@@ -744,6 +985,226 @@ class MoeLlm:
             await self.send_reply_message(MessageSegment.image(image_bytes))
             sent_count += 1
         return sent_count
+
+    async def _handle_chat_tool_calls(
+        self,
+        tool_calls: list[dict],
+        *,
+        external_image_generation: bool,
+        local_image_cache: bool,
+    ) -> tuple[bool, int | str]:
+        rerun_requested = False
+        sent_images = 0
+        for tool_call in tool_calls:
+            name = tool_call.get("name")
+            arguments = tool_call.get("arguments") or "{}"
+            try:
+                parsed_arguments = json.loads(arguments)
+            except ValueError:
+                parsed_arguments = {}
+            if name == "fetch_recent_images" and local_image_cache:
+                max_limit = int(config_parser.get_config("fetch_recent_images_max_limit") or 6)
+                default_limit = int(config_parser.get_config("fetch_recent_images_default_limit") or 3)
+                limit = parsed_arguments.get("limit") or default_limit
+                offset = parsed_arguments.get("offset") or 0
+                self.fetch_recent_images_rounds += 1
+                fetched_images = image_cache.get_recent_group_images(
+                    group_id=self.event.group_id,
+                    limit=max(1, min(int(limit), max_limit)),
+                    offset=max(0, int(offset)),
+                )
+                known_image_ids = {image.get("image_id") for image in self.fetched_images}
+                self.fetched_images.extend(
+                    image
+                    for image in fetched_images
+                    if image.get("image_id") not in known_image_ids
+                )
+                if fetched_images:
+                    rerun_requested = True
+            elif name == "fetch_user_avatar":
+                user_ref = str(parsed_arguments.get("user_ref") or "").strip()
+                if user_ref:
+                    known_avatar_refs = {
+                        str(item.get("user_ref"))
+                        for item in self.pending_user_avatar_requests
+                        if item.get("user_ref")
+                    }
+                    if user_ref not in known_avatar_refs:
+                        self.pending_user_avatar_requests.append({"user_ref": user_ref})
+                        rerun_requested = True
+            elif name == "get_imagegen_instructions":
+                if not self.imagegen_instructions_provided:
+                    self.imagegen_instructions_provided = True
+                    rerun_requested = True
+            elif name in {"image_generation", "generate_image"} and external_image_generation:
+                generated_requests = self._extract_image_generation_args(
+                    {"output": [{"type": "function_call", "name": name, "arguments": arguments}]}
+                )
+                generated = await self._generate_external_images(generated_requests)
+                if isinstance(generated, str):
+                    return False, generated
+                sent_images += generated
+            elif name == "image_edit" and external_image_generation:
+                edited_requests = self._extract_image_edit_args(
+                    {"output": [{"type": "function_call", "name": name, "arguments": arguments}]}
+                )
+                edited = await self._edit_external_images(edited_requests)
+                if isinstance(edited, str):
+                    return False, edited
+                sent_images += edited
+        return rerun_requested, sent_images
+
+    async def _chat_completions_once(
+        self,
+        session,
+        url,
+        headers,
+        data,
+        proxy,
+    ) -> dict | str | bool:
+        if self.model_info.get("stream"):
+            streamed_text_chunks = []
+            streamed_tool_calls = {}
+            async with session.post(url, headers=headers, json=data, proxy=proxy) as response:
+                if error_msg := await self._check_400_error(response):
+                    return error_msg
+                if response.status != 200:
+                    logger.warning(f"Warning: {response}")
+                    return False
+                async for line in response.content:
+                    if not line or line.startswith(b"data: [DONE]") or line.startswith(b"[DONE]"):
+                        break
+                    decoded = (
+                        line[5:].decode("utf-8")
+                        if line.startswith(b"data:")
+                        else line.decode("utf-8")
+                    )
+                    if not decoded.strip() or decoded.startswith(":"):
+                        continue
+                    json_data = json.loads(decoded)
+                    choices = json_data.get("choices", [{}])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}) or {}
+                    content = delta.get("content", "")
+                    if content:
+                        streamed_text_chunks.append(content)
+                    for tool_call in delta.get("tool_calls") or []:
+                        index = tool_call.get("index", 0)
+                        current = streamed_tool_calls.setdefault(
+                            index,
+                            {
+                                "id": tool_call.get("id"),
+                                "name": None,
+                                "arguments": "",
+                            },
+                        )
+                        if tool_call.get("id"):
+                            current["id"] = tool_call.get("id")
+                        function = tool_call.get("function") or {}
+                        if function.get("name"):
+                            current["name"] = function.get("name")
+                        if function.get("arguments"):
+                            current["arguments"] += function.get("arguments")
+            ordered_tool_calls = [
+                {
+                    "id": item.get("id") or f"chat_tool_call_{index}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments") or "{}",
+                    },
+                }
+                for index, item in sorted(streamed_tool_calls.items())
+                if item.get("name")
+            ]
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "".join(streamed_text_chunks).strip(),
+                            "tool_calls": ordered_tool_calls or None,
+                        }
+                    }
+                ]
+            }
+        async with session.post(
+            url=url,
+            json=data,
+            headers=headers,
+            ssl=False,
+            proxy=proxy,
+        ) as resp:
+            if error_msg := await self._check_400_error(resp):
+                return error_msg
+            response = await resp.json()
+            if resp.status != 200 or not response:
+                logger.warning(response)
+                return False
+        return response
+
+    async def chat_completions_llm_chat(
+        self,
+        session,
+        url,
+        headers,
+        send_message_list,
+        proxy,
+        external_image_generation=False,
+        local_image_cache=False,
+    ) -> bool | str:
+        max_tool_rounds = 5
+        for _ in range(max_tool_rounds):
+            chat_messages = await self._build_chat_messages(session, send_message_list)
+            chat_messages.insert(0, {"role": "system", "content": self.prompt})
+            payload = {
+                "model": self.model_info["model"],
+                "messages": chat_messages,
+                "max_tokens": self.model_info.get("max_tokens"),
+                "temperature": self.model_info.get("temperature"),
+                "top_p": self.model_info.get("top_p"),
+                "stream": self.model_info.get("stream", False),
+            }
+            if self.model_info.get("top_k"):
+                payload["top_k"] = self.model_info.get("top_k")
+            tools = self._build_chat_tools(
+                external_image_generation=external_image_generation,
+                local_image_cache=local_image_cache,
+            )
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+
+            response = await self._chat_completions_once(session, url, headers, payload, proxy)
+            if isinstance(response, str):
+                return response
+            if response is False:
+                return False
+
+            tool_calls = self._extract_chat_tool_calls(response)
+            if tool_calls:
+                rerun_requested, sent_images = await self._handle_chat_tool_calls(
+                    tool_calls,
+                    external_image_generation=external_image_generation,
+                    local_image_cache=local_image_cache,
+                )
+                if isinstance(sent_images, str):
+                    return sent_images
+                if rerun_requested and sent_images == 0:
+                    continue
+                if sent_images > 0:
+                    return True
+
+            message = (response.get("choices") or [{}])[0].get("message") or {}
+            assistant_reply = self._strip_think_tags(str(message.get("content") or "")).strip()
+            if not assistant_reply:
+                return False
+            if not self.is_objective:
+                self.messages_handler.post_process(assistant_reply)
+            await self._send_text_response(assistant_reply)
+            return True
+        return "工具调用轮次过多。"
 
     async def _prepare_images(
         self,
@@ -1382,33 +1843,6 @@ class MoeLlm:
         )
         use_external_image_generation = self._use_external_image_generation()
 
-        if not self._use_responses_api():
-            send_message_list.insert(0, {"role": "system", "content": self.prompt})
-            if self.model_info.get("is_vision") and self.messages_handler.current_images:
-                current_msg = send_message_list[-1]
-                vision_content = [{"type": "text", "text": current_msg["content"]}]
-                for image in self.messages_handler.current_images:
-                    if url := image.get("source_url"):
-                        vision_content.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": url},
-                            }
-                        )
-                send_message_list[-1]["content"] = vision_content
-            data = {
-                "model": self.model_info["model"],
-                "messages": send_message_list,
-                "max_tokens": self.model_info.get("max_tokens"),
-                "temperature": self.model_info.get("temperature"),
-                "top_p": self.model_info.get("top_p"),
-                "stream": self.model_info.get("stream", False),
-            }
-            if self.model_info.get("top_k"):
-                data["top_k"] = self.model_info.get("top_k")
-        else:
-            data = None
-
         headers = {
             "Authorization": self.model_info["key"],
             "Content-Type": "application/json",
@@ -1429,21 +1863,14 @@ class MoeLlm:
                         external_image_generation=use_external_image_generation,
                         local_image_cache=True,
                     )
-                if self.model_info.get("stream"):
-                    return await self.stream_llm_chat(
-                        session,
-                        self.model_info["url"],
-                        headers,
-                        data,
-                        self.model_info.get("proxy"),
-                        self.model_info.get("is_segment"),
-                    )
-                return await self.none_stream_llm_chat(
+                return await self.chat_completions_llm_chat(
                     session,
                     self.model_info["url"],
                     headers,
-                    json.dumps(data),
+                    send_message_list,
                     self.model_info.get("proxy"),
+                    external_image_generation=use_external_image_generation,
+                    local_image_cache=True,
                 )
             except RuntimeError as exc:
                 return str(exc)
