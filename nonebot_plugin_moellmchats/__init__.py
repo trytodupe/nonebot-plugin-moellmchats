@@ -14,6 +14,7 @@ from .Config import config_parser
 from .ImageCache import image_cache
 from .access_control import evaluate_private_access, is_access_request_plugin_available, is_private_acl_exempt_user
 from .utils import format_message
+from .trigger_rules import contains_doubao_help_trigger, should_trigger_group_chat
 
 
 __plugin_meta__ = PluginMetadata(
@@ -120,12 +121,22 @@ async def at_me_only(bot: Bot, event: MessageEvent) -> bool:
     return False
 
 
+def _contains_doubao_help_trigger(message) -> bool:
+    return contains_doubao_help_trigger(message.extract_plain_text())
+
+
+async def group_chat_trigger(bot: Bot, event: MessageEvent) -> bool:
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    return should_trigger_group_chat(await at_me_only(bot, event), event.get_message().extract_plain_text())
+
+
 def private_message_only(event: MessageEvent) -> bool:
     return isinstance(event, PrivateMessageEvent) and not is_private_acl_exempt_user(event.user_id)
 
 
 llm_matcher = on_message(
-    rule=Rule(at_me_only),
+    rule=Rule(group_chat_trigger),
     permission=GROUP,
     priority=99,
     block=True,
