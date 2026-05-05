@@ -60,7 +60,10 @@ async def format_message(event, bot) -> dict:
         if msgseg.type == "at":
             qq = msgseg.data.get("qq")
             if qq != nonebot.get_bot().self_id:
-                name = await get_member_name(event.group_id, qq, bot)
+                if hasattr(event, "group_id"):
+                    name = await get_member_name(event.group_id, qq, bot)
+                else:
+                    name = str(qq)
                 mentioned_user_index += 1
                 ref = f"mentioned_user_{mentioned_user_index}"
                 user_refs.append(

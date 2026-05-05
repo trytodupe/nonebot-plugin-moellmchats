@@ -85,6 +85,12 @@ class MoeLlm:
         self.image_inputs_by_id = {}
         self.imagegen_instructions_provided = False
         self.generation_notice_sent = False
+        self.session_key = self._build_session_key()
+
+    def _build_session_key(self) -> str:
+        if hasattr(self.event, "group_id"):
+            return f"group:{self.event.group_id}"
+        return f"private:{self.event.user_id}"
 
     def _reply_segment(self):
         if message_id := getattr(self.event, "message_id", None):
@@ -191,7 +197,7 @@ class MoeLlm:
         return bool(self.model_info.get("is_vision") or self._use_responses_api())
 
     def prompt_handler(self):
-        recent_context = list(context_dict[self.event.group_id])[:-1]
+        recent_context = list(context_dict[self.session_key])[:-1]
         self.prompt = build_group_chat_prompt(
             BASE_PROMPT,
             recent_context,
@@ -1003,6 +1009,8 @@ class MoeLlm:
             except ValueError:
                 parsed_arguments = {}
             if name == "fetch_recent_images" and local_image_cache:
+                if not self._can_use_group_image_cache():
+                    continue
                 max_limit = int(config_parser.get_config("fetch_recent_images_max_limit") or 6)
                 default_limit = int(config_parser.get_config("fetch_recent_images_default_limit") or 3)
                 limit = parsed_arguments.get("limit") or default_limit
@@ -1435,15 +1443,18 @@ class MoeLlm:
         self.messages_handler.update_current_user_message_with_image_summaries()
 
     def _sync_group_context_with_current_user_message(self):
-        group_messages = context_dict[self.event.group_id]
-        if not group_messages:
+        session_messages = context_dict[self.session_key]
+        if not session_messages:
             return
         sender_name = self.event.sender.card or self.event.sender.nickname
-        group_messages[-1] = {
+        session_messages[-1] = {
             "speaker_name": sender_name,
             "content": self.messages_handler.new_user_msg["content"],
             "images": self.messages_handler.current_images,
         }
+
+    def _can_use_group_image_cache(self) -> bool:
+        return hasattr(self.event, "group_id")
 
     def _extract_stream_text_delta(self, event) -> str:
         delta = getattr(event, "delta", None)
@@ -1461,6 +1472,8 @@ class MoeLlm:
         return any(word in text for word in image_words) and any(word in text for word in reference_words)
 
     def _prefetch_recent_images_if_needed(self):
+        if not self._can_use_group_image_cache():
+            return
         if self.messages_handler.current_images or self.fetched_images:
             return
         if not self._looks_like_recent_image_request():
@@ -1725,6 +1738,8 @@ class MoeLlm:
         if local_image_cache and self.fetch_recent_images_rounds < max_fetch_rounds:
             fetch_args = self._extract_fetch_recent_images_args(body)
             if fetch_args:
+                if not self._can_use_group_image_cache():
+                    return False
                 self.fetch_recent_images_rounds += 1
                 fetched_images = image_cache.get_recent_group_images(
                     group_id=self.event.group_id,

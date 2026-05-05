@@ -2,7 +2,7 @@ import asyncio
 from collections import defaultdict
 
 import aiohttp
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, GROUP
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, PrivateMessageEvent, GROUP
 from nonebot.plugin import PluginMetadata, require
 from nonebot.plugin.on import on_message
 from nonebot.rule import Rule
@@ -12,6 +12,7 @@ require("nonebot_plugin_localstore")
 from . import moe_llm as llm
 from .Config import config_parser
 from .ImageCache import image_cache
+from .access_control import evaluate_private_access, is_access_request_plugin_available, is_private_acl_exempt_user
 from .utils import format_message
 
 
@@ -26,6 +27,12 @@ __plugin_meta__ = PluginMetadata(
 
 cd = defaultdict(int)
 is_repeat_ask_dict = defaultdict(bool)
+
+
+def _session_key(event: MessageEvent) -> str:
+    if isinstance(event, GroupMessageEvent):
+        return f"group:{event.group_id}"
+    return f"private:{event.user_id}"
 
 message_matcher = on_message(permission=GROUP, priority=1, block=False)
 
@@ -53,7 +60,7 @@ async def context_dict_func(bot: Bot, event: MessageEvent):
             if cached_images:
                 message_dict["images"] = cached_images
             sender_name = event.sender.card or event.sender.nickname
-            llm.context_dict[event.group_id].append(
+            llm.context_dict[_session_key(event)].append(
                 {
                     "speaker_name": sender_name,
                     "content": "".join(message_dict["text"]),
@@ -64,7 +71,7 @@ async def context_dict_func(bot: Bot, event: MessageEvent):
 
 async def handle_llm(
     bot: Bot,
-    event: GroupMessageEvent,
+    event: MessageEvent,
     matcher,
     format_message_dict: dict,
 ):
@@ -113,6 +120,10 @@ async def at_me_only(bot: Bot, event: MessageEvent) -> bool:
     return False
 
 
+def private_message_only(event: MessageEvent) -> bool:
+    return isinstance(event, PrivateMessageEvent) and not is_private_acl_exempt_user(event.user_id)
+
+
 llm_matcher = on_message(
     rule=Rule(at_me_only),
     permission=GROUP,
@@ -132,3 +143,28 @@ async def _(bot: Bot, event: MessageEvent):
     if cached_images:
         format_message_dict["images"] = cached_images
     await handle_llm(bot, event, llm_matcher, format_message_dict)
+
+
+private_llm_matcher = on_message(
+    rule=Rule(private_message_only),
+    priority=99,
+    block=True,
+)
+
+
+@private_llm_matcher.handle()
+async def handle_private_llm(bot: Bot, event: MessageEvent):
+    if not isinstance(event, PrivateMessageEvent):
+        return
+    format_message_dict = await format_message(event, bot)
+    plain_text = "".join(format_message_dict.get("text") or []).strip()
+    decision = await evaluate_private_access(bot, event, plain_text)
+    if decision.reply_text:
+        llm_sender = llm.MoeLlm(bot, event, format_message_dict)
+        await llm_sender.send_reply_message(decision.reply_text)
+    if not decision.allowed:
+        await private_llm_matcher.finish()
+        return
+    if not format_message_dict["text"] and not format_message_dict["images"]:
+        return
+    await handle_llm(bot, event, private_llm_matcher, format_message_dict)
