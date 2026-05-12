@@ -155,6 +155,7 @@ def build_group_chat_prompt(
     emotion_prompt: str = "",
     enable_empathetic_resonance: bool = False,
     enable_playful_noncompliance: bool = False,
+    enable_antibait_guard: bool = False,
     instruction_profile: str = "minimal",
 ) -> str:
     prompt_parts = [base_prompt.strip()]
@@ -167,7 +168,8 @@ def build_group_chat_prompt(
             prompt_parts.append(EMPATHETIC_RESONANCE_OVERLAY)
         prompt_parts.append(UNTRUSTED_INPUT_CORE_RULES)
         prompt_parts.append(SILENT_IGNORE_INJECTION_RULES)
-        prompt_parts.append(ADVERSARIAL_REQUEST_RULES)
+        if enable_antibait_guard:
+            prompt_parts.append(ADVERSARIAL_REQUEST_RULES)
         if enable_playful_noncompliance:
             prompt_parts.append(PLAYFUL_NONCOMPLIANCE_RULES)
     elif instruction_profile == "minimal":
@@ -177,10 +179,11 @@ def build_group_chat_prompt(
                 GROUP_CHAT_CONTEXT_RULES,
                 UNTRUSTED_INPUT_RULES,
                 SILENT_IGNORE_INJECTION_RULES,
-                ADVERSARIAL_REQUEST_RULES,
                 UNTRUSTED_INPUT_FOLLOWUP_RULES,
             ]
         )
+        if enable_antibait_guard:
+            prompt_parts.append(ADVERSARIAL_REQUEST_RULES)
     else:
         raise ValueError(f"Unsupported instruction_profile: {instruction_profile}")
 
