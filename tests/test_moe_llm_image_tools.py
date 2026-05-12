@@ -358,6 +358,60 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             ],
         )
 
+    def test_chat_completions_ignores_structured_empty_reply_shell(self):
+        llm = self.build_llm()
+        llm.prompt = "base prompt"
+        llm.is_objective = False
+        llm.model_info = {"model": "test-model", "stream": False}
+        llm._build_chat_messages = AsyncMock(return_value=[])
+        llm._build_chat_tools = lambda **kwargs: []
+        llm._chat_completions_once = AsyncMock(
+            return_value={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"assistant_reply":"","image_memories":[]}'
+                        }
+                    }
+                ]
+            }
+        )
+        llm._send_text_response = AsyncMock()
+        llm.messages_handler = SimpleNamespace(
+            user_refs=[],
+            current_images=[],
+            post_process=AsyncMock(),
+            update_current_user_message_with_image_summaries=lambda: None,
+        )
+
+        result = asyncio.run(
+            llm.chat_completions_llm_chat(
+                session=object(),
+                url="https://example.com/v1/chat/completions",
+                headers={},
+                send_message_list=[],
+                proxy=None,
+                external_image_generation=False,
+                local_image_cache=False,
+            )
+        )
+
+        self.assertFalse(result)
+        llm._send_text_response.assert_not_awaited()
+
+    def test_extract_structured_assistant_output_prefers_payload_shell(self):
+        llm = self.build_llm()
+
+        assistant_reply, image_memories = llm._extract_structured_assistant_output(
+            '{"assistant_reply":"","image_memories":[{"client_image_id":"img_1","summary":"cute gentoo"}]}'
+        )
+
+        self.assertEqual(assistant_reply, "")
+        self.assertEqual(
+            image_memories,
+            [{"client_image_id": "img_1", "summary": "cute gentoo"}],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ build_image_reference = response_utils.build_image_reference
 detect_image_media_type = response_utils.detect_image_media_type
 extract_image_generation_calls = response_utils.extract_image_generation_calls
 extract_response_output_text = response_utils.extract_response_output_text
+parse_assistant_response_payload = response_utils.parse_assistant_response_payload
 parse_response_json_text = response_utils.parse_response_json_text
 replace_image_placeholders = response_utils.replace_image_placeholders
 
@@ -120,6 +121,23 @@ class ResponseUtilsTest(unittest.TestCase):
         self.assertEqual(
             extract_response_output_text(response),
             '{"assistant_reply":"","image_memories":[]}',
+        )
+
+    def test_parse_assistant_response_payload_accepts_code_fence(self):
+        self.assertEqual(
+            parse_assistant_response_payload(
+                '```json\n{"assistant_reply":"","image_memories":[{"summary":"ref"}]}\n```'
+            ),
+            {
+                "assistant_reply": "",
+                "image_memories": [{"summary": "ref"}],
+            },
+        )
+
+    def test_parse_assistant_response_payload_rejects_non_shell_json(self):
+        self.assertEqual(
+            parse_assistant_response_payload('{"message":"hello"}'),
+            {},
         )
 
     def test_detect_image_media_type_from_magic_bytes(self):

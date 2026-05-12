@@ -27,6 +27,7 @@ from .response_utils import (
     extract_response_output_text,
     is_long_message,
     normalize_image_summary,
+    parse_assistant_response_payload,
     replace_image_placeholders,
 )
 from .prompt_templates import build_group_chat_prompt
@@ -258,6 +259,8 @@ class MoeLlm:
                 if content:
                     buffer.append(content)
         result = "".join(buffer).strip()
+        result, image_memories = self._extract_structured_assistant_output(result)
+        self._apply_image_memory_updates(image_memories)
         if not result:
             return False
         if not self.is_objective:
@@ -283,21 +286,10 @@ class MoeLlm:
         if not choices:
             logger.warning(response)
             return False
-        content = choices[0]["message"]["content"]
-        start_tag = "<think>"
-        end_tag = "</think>"
-        start = content.find(start_tag)
-        end = content.find(end_tag)
-        if start == -1 and end != -1:
-            end += len(end_tag)
-            start = 0
-            result = content[:start] + content[end:]
-        elif start != -1 and end != -1:
-            end += len(end_tag)
-            result = content[:start] + content[end:]
-        else:
-            result = content
-        result = result.strip()
+        result, image_memories = self._extract_structured_assistant_output(
+            choices[0]["message"].get("content") or ""
+        )
+        self._apply_image_memory_updates(image_memories)
         if not result:
             return False
         if not self.is_objective:
@@ -827,6 +819,29 @@ class MoeLlm:
             return content[:start] + content[end:]
         return content
 
+    def _extract_structured_assistant_output(
+        self, *candidates: str | None
+    ) -> tuple[str, list[dict]]:
+        normalized_candidates = []
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            normalized = self._strip_think_tags(candidate).strip()
+            if not normalized:
+                continue
+            normalized_candidates.append(normalized)
+            parsed = parse_assistant_response_payload(normalized)
+            if parsed:
+                return (
+                    str(parsed.get("assistant_reply") or "").strip(),
+                    parsed.get("image_memories") or [],
+                )
+
+        for normalized in normalized_candidates:
+            if normalized:
+                return normalized, []
+        return "", []
+
     def _image_api_headers(self, api_key: str, *, multipart: bool = False) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -1205,7 +1220,10 @@ class MoeLlm:
                     return True
 
             message = (response.get("choices") or [{}])[0].get("message") or {}
-            assistant_reply = self._strip_think_tags(str(message.get("content") or "")).strip()
+            assistant_reply, image_memories = self._extract_structured_assistant_output(
+                str(message.get("content") or "")
+            )
+            self._apply_image_memory_updates(image_memories)
             if not assistant_reply:
                 return False
             if not self.is_objective:
@@ -1799,27 +1817,14 @@ class MoeLlm:
             if image_call.get("image_id") not in sent_stream_image_ids
         ]
 
-        assistant_reply = "".join(streamed_text_chunks).strip()
-        if not assistant_reply:
-            assistant_reply = extract_response_output_text(body)
-
-        image_memories = []
+        streamed_reply = "".join(streamed_text_chunks).strip()
+        body_output_text = extract_response_output_text(body)
         output_text_obj = getattr(final_response, "output_text", None) if final_response is not None else None
-        if output_text_obj and isinstance(output_text_obj, str):
-            try:
-                parsed = json.loads(output_text_obj)
-            except ValueError:
-                parsed = {}
-            assistant_reply = (parsed.get("assistant_reply") or assistant_reply).strip()
-            image_memories = parsed.get("image_memories") or []
-        elif isinstance(assistant_reply, str):
-            try:
-                parsed = json.loads(assistant_reply)
-            except ValueError:
-                parsed = {}
-            if parsed:
-                assistant_reply = (parsed.get("assistant_reply") or "").strip()
-                image_memories = parsed.get("image_memories") or []
+        assistant_reply, image_memories = self._extract_structured_assistant_output(
+            output_text_obj if isinstance(output_text_obj, str) else None,
+            streamed_reply,
+            body_output_text,
+        )
 
         if not assistant_reply and not image_calls and sent_stream_image_count == 0 and external_sent_images == 0:
             if self.fetched_images and self._looks_like_recent_image_request():

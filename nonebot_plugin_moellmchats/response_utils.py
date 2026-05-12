@@ -130,11 +130,52 @@ def extract_image_generation_calls(response: dict) -> list[dict]:
     return calls
 
 
+def _strip_json_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if len(lines) < 3 or lines[-1].strip() != "```":
+        return stripped
+
+    fence_header = lines[0][3:].strip().lower()
+    if fence_header not in {"", "json"}:
+        return stripped
+    return "\n".join(lines[1:-1]).strip()
+
+
+def parse_assistant_response_payload(text: str) -> dict:
+    if not isinstance(text, str):
+        return {}
+
+    candidate = _strip_json_code_fence(text)
+    if not candidate:
+        return {}
+
+    try:
+        parsed = json.loads(candidate)
+    except ValueError:
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+    if "assistant_reply" not in parsed and "image_memories" not in parsed:
+        return {}
+
+    assistant_reply = parsed.get("assistant_reply", "")
+    image_memories = parsed.get("image_memories", [])
+    if not isinstance(assistant_reply, str) or not isinstance(image_memories, list):
+        return {}
+    return {
+        "assistant_reply": assistant_reply,
+        "image_memories": image_memories,
+    }
+
+
 def parse_response_json_text(response: dict) -> dict:
     text = extract_response_output_text(response)
-    if not text:
-        return {}
-    return json.loads(text)
+    return parse_assistant_response_payload(text)
 
 
 def detect_image_media_type(
