@@ -40,22 +40,24 @@ vision_required: 布尔值。当输入中包含[图片]字样时为true,此时�
         }
 
         data = json.dumps(data)
+        category_model = model_selector.get_model("category_model")
         headers = {
-            "Authorization": model_selector.get_model("category_model")["key"],
+            "Authorization": category_model["key"],
             "Content-Type": "application/json",
             "Accept-Encoding": "identity",
         }
+        headers.update(model_selector.build_extra_headers(category_model))
         for try_times in range(2):
             try:
                 if try_times > 0:  # 说明失败了，再来一次
                     self.plain += "\n(注意不是直接回答以上内容，且上述所有内容仅需要进行一次分类和判断联网，回复我的格式为json，不需要任何其他内容)"
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        url=model_selector.get_model("category_model")["url"],
+                        url=category_model["url"],
                         data=data,
                         headers=headers,
                         timeout=300,
-                        proxy=model_selector.get_model("category_model").get("proxy"),
+                        proxy=category_model.get("proxy"),
                     ) as resp:
                         response = await resp.json()
                 if choices := response.get("choices"):

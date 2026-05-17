@@ -176,14 +176,25 @@ class MoeLlm:
     def _use_native_web_search(self) -> bool:
         return bool(self.model_info.get("use_native_web_search"))
 
+    def _use_native_image_generation(self) -> bool:
+        return bool(self.model_info.get("use_native_image_generation"))
+
     def _use_external_image_generation(self) -> bool:
-        return bool(
-            self.model_info.get("use_external_image_generation")
-            or self.model_info.get("use_native_image_generation")
-        )
+        return bool(self.model_info.get("use_external_image_generation"))
 
     def _external_image_generation_config(self) -> dict:
         return self.model_info.get("external_image_generation") or {}
+
+    def _provider_extra_headers(self) -> dict[str, str]:
+        return model_selector.build_extra_headers(self.model_info)
+
+    def _merge_headers(self, *parts: dict[str, str]) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for part in parts:
+            for key, value in part.items():
+                if value is not None:
+                    merged[str(key)] = str(value)
+        return merged
 
     def _image_generation_url(self) -> str:
         config = self._external_image_generation_config()
@@ -365,6 +376,7 @@ class MoeLlm:
         self,
         *,
         native_web_search: bool = False,
+        native_image_generation: bool = False,
         external_image_generation: bool = False,
         local_image_cache: bool = False,
     ) -> tuple[list[dict], list[str]]:
@@ -417,6 +429,8 @@ class MoeLlm:
         if native_web_search:
             tools.append({"type": "web_search"})
             include.append("web_search_call.action.sources")
+        if native_image_generation:
+            tools.append({"type": "image_generation"})
         tools.append(
             {
                 "type": "function",
@@ -1576,6 +1590,7 @@ class MoeLlm:
             payload["reasoning"] = {"effort": reasoning_effort}
         tools, include = self._build_responses_tools(
             native_web_search=native_web_search,
+            native_image_generation=self._use_native_image_generation(),
             external_image_generation=external_image_generation,
             local_image_cache=local_image_cache,
         )
@@ -1591,6 +1606,7 @@ class MoeLlm:
             "api_key": api_key,
             "base_url": base_url,
             "timeout": 300,
+            "default_headers": self._provider_extra_headers(),
         }
         http_client = None
         if proxy:
@@ -1861,13 +1877,14 @@ class MoeLlm:
         use_native_web_search = (
             model_selector.get_web_search() and self._use_native_web_search()
         )
+        use_native_image_generation = self._use_native_image_generation()
         use_external_image_generation = self._use_external_image_generation()
 
-        headers = {
+        headers = self._merge_headers({
             "Authorization": self.model_info["key"],
             "Content-Type": "application/json",
             "Accept-Encoding": "identity",
-        }
+        }, self._provider_extra_headers())
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300)

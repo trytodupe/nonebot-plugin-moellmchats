@@ -1,9 +1,12 @@
 from pathlib import Path
+import os
+import platform
 import ujson as json
 
 import nonebot_plugin_localstore as store
 
 config_path: Path = store.get_plugin_config_dir()
+DEFAULT_CODEX_ORIGINATOR = "codex_cli_rs"
 
 
 # 模型选择类
@@ -94,6 +97,41 @@ class ModelSelector:
         # 将配置写入文件
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, ensure_ascii=False, indent=4)
+
+    def build_extra_headers(self, model_info: dict | None) -> dict[str, str]:
+        if not model_info:
+            return {}
+        configured = model_info.get("extra_headers") or {}
+        headers = {
+            str(key): str(value)
+            for key, value in configured.items()
+            if key and value is not None
+        }
+        if not model_info.get("use_codex_cli_headers"):
+            return headers
+
+        originator = str(headers.get("originator") or DEFAULT_CODEX_ORIGINATOR).strip()
+        if originator:
+            headers.setdefault("originator", originator)
+
+        version = str(model_info.get("codex_cli_version") or "0.130.0").strip()
+        term = (
+            os.getenv("TERM_PROGRAM")
+            or ("kitty" if os.getenv("KITTY_WINDOW_ID") else None)
+            or os.getenv("TERM")
+            or "unknown"
+        )
+        headers.setdefault(
+            "User-Agent",
+            f"{originator}/{version} "
+            f"({platform.system()} {platform.mac_ver()[0] or platform.release()}; {platform.machine()}) "
+            f"{term}",
+        )
+        headers.setdefault(
+            "x-codex-window-id",
+            str(model_info.get("codex_window_id") or "moellmchats:0"),
+        )
+        return headers
 
     def get_moe(self):
         # 获取当前是否使用MOE

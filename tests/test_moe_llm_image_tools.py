@@ -99,6 +99,15 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertIn("image_generation", tool_names)
         self.assertIn("image_edit", tool_names)
 
+    def test_builds_native_image_generation_tool(self):
+        llm = self.build_llm()
+        tools, include = llm._build_responses_tools(native_image_generation=True)
+        tool_names = [tool.get("name") or tool.get("type") for tool in tools]
+
+        self.assertEqual(include, [])
+        self.assertIn("image_generation", tool_names)
+        self.assertIn("get_imagegen_instructions", tool_names)
+
     def test_exposes_imagegen_instructions_without_external_image_tools(self):
         llm = self.build_llm()
         tools, include = llm._build_responses_tools(external_image_generation=False)
@@ -118,6 +127,43 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertIn("get_imagegen_instructions", tool_names)
         self.assertIn("image_generation", tool_names)
         self.assertIn("image_edit", tool_names)
+
+    def test_builds_codex_cli_headers(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "use_codex_cli_headers": True,
+            "codex_cli_version": "0.130.0",
+            "codex_window_id": "manual-test:0",
+        }
+
+        with patch.dict(
+            "os.environ",
+            {
+                "KITTY_WINDOW_ID": "2",
+            },
+            clear=False,
+        ):
+            headers = llm._provider_extra_headers()
+
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertEqual(headers["x-codex-window-id"], "manual-test:0")
+        self.assertIn("codex_cli_rs/0.130.0", headers["User-Agent"])
+        self.assertTrue(headers["User-Agent"].endswith(" kitty"))
+
+    def test_prefers_explicit_extra_headers(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "use_codex_cli_headers": True,
+            "extra_headers": {
+                "originator": "custom_originator",
+                "User-Agent": "CustomUA/1.0",
+            },
+        }
+
+        headers = llm._provider_extra_headers()
+
+        self.assertEqual(headers["originator"], "custom_originator")
+        self.assertEqual(headers["User-Agent"], "CustomUA/1.0")
 
     def test_extracts_generation_and_legacy_generate_image_args(self):
         llm = self.build_llm()
