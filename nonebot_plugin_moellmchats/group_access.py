@@ -1,11 +1,9 @@
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from nonebot import get_driver
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.log import logger
-
-if TYPE_CHECKING:
-    from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 
 _EVENT_CACHE_LIMIT = 1024
 _event_access_cache: OrderedDict[tuple[str, int, int], bool] = OrderedDict()
@@ -16,7 +14,7 @@ def _configured_superusers() -> set[str]:
     return {str(user_id).strip() for user_id in configured if str(user_id).strip()}
 
 
-def _event_cache_key(bot: "Bot", event: Any) -> tuple[str, int, int] | None:
+def _event_cache_key(bot: Bot, event: Any) -> tuple[str, int, int] | None:
     message_id = getattr(event, "message_id", None)
     if message_id is None:
         return None
@@ -32,7 +30,7 @@ def _cache_result(key: tuple[str, int, int] | None, allowed: bool) -> None:
         _event_access_cache.popitem(last=False)
 
 
-async def group_has_superuser(bot: "Bot", event: "MessageEvent") -> bool:
+async def group_has_superuser(bot: Bot, event: MessageEvent) -> bool:
     if not hasattr(event, "group_id"):
         return False
 

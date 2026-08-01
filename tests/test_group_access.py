@@ -9,6 +9,10 @@ nonebot_module = sys.modules.get("nonebot") or ModuleType("nonebot")
 nonebot_module.get_driver = lambda: SimpleNamespace(config=SimpleNamespace(superusers=set()))
 sys.modules["nonebot"] = nonebot_module
 sys.modules.setdefault(
+    "nonebot.adapters.onebot.v11",
+    SimpleNamespace(Bot=object, MessageEvent=object),
+)
+sys.modules.setdefault(
     "nonebot.log",
     SimpleNamespace(logger=SimpleNamespace(warning=lambda *args, **kwargs: None)),
 )
