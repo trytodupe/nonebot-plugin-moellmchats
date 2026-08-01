@@ -210,9 +210,11 @@ class MoeLlm:
 
     def prompt_handler(self):
         recent_context = list(context_dict[self.session_key])[:-1]
+        safeguards_enabled = config_parser.get_config("safeguards_enabled") is not False
         self.prompt = build_group_chat_prompt(
             BASE_PROMPT,
             recent_context,
+            enable_safeguards=safeguards_enabled,
             instruction_profile="minimal",
         )
 

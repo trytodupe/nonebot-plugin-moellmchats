@@ -148,6 +148,7 @@ COMMAND_START=["/",""]  # 可选
   cd_seconds: 0, // 每个用户冷却时间（秒）
   search_api: "Bearer your_tavily_key", // 旧版 Tavily 联网搜索 key。若使用 Responses API + native web_search，可留空
   fastai_enabled: false, // 快速AI助手开关。方便快速调用纯AI助手，无角色扮演。调用快速AI助手时，仅有用户上下文，不会有群聊上下文。不会分段发送也不会发表情包。调用方法下文提到。
+  safeguards_enabled: true, // 群聊 prompt safeguard 总开关：不可信输入、静默忽略 injection、injection follow-up。缺省为 true
   emotions_enabled: false, // 是否开启表情包（只有stream和is_segmemt为true才会发送表情包，模型设置中设置）
   emotion_rate: 0.1, // 发送表情包概率（0-1）（经测试 LLM 几乎每句都会发送表情包，所以手动设置概率）
   emotions_dir: "absolute path", // 表情包目录，绝对路径

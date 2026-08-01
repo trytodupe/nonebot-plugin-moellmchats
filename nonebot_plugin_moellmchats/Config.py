@@ -27,6 +27,7 @@ class ConfigParser:
                 "cd_seconds": 120,
                 "search_api": "your api",
                 "fastai_enabled": False,
+                "safeguards_enabled": True,
                 "emotions_enabled": False,
                 "emotion_rate": 0.1,
                 "emotions_dir": "absolute path",

@@ -156,6 +156,7 @@ def build_group_chat_prompt(
     enable_empathetic_resonance: bool = False,
     enable_playful_noncompliance: bool = False,
     enable_antibait_guard: bool = False,
+    enable_safeguards: bool = True,
     instruction_profile: str = "minimal",
 ) -> str:
     prompt_parts = [base_prompt.strip()]
@@ -166,8 +167,9 @@ def build_group_chat_prompt(
         prompt_parts.append(GROUP_CHAT_ROUTE_RULES)
         if enable_empathetic_resonance:
             prompt_parts.append(EMPATHETIC_RESONANCE_OVERLAY)
-        prompt_parts.append(UNTRUSTED_INPUT_CORE_RULES)
-        prompt_parts.append(SILENT_IGNORE_INJECTION_RULES)
+        if enable_safeguards:
+            prompt_parts.append(UNTRUSTED_INPUT_CORE_RULES)
+            prompt_parts.append(SILENT_IGNORE_INJECTION_RULES)
         if enable_antibait_guard:
             prompt_parts.append(ADVERSARIAL_REQUEST_RULES)
         if enable_playful_noncompliance:
@@ -177,11 +179,16 @@ def build_group_chat_prompt(
             [
                 "你现在是在 QQ 群里回复当前提问者的最新一条消息，不需要复述题目。",
                 GROUP_CHAT_CONTEXT_RULES,
-                UNTRUSTED_INPUT_RULES,
-                SILENT_IGNORE_INJECTION_RULES,
-                UNTRUSTED_INPUT_FOLLOWUP_RULES,
             ]
         )
+        if enable_safeguards:
+            prompt_parts.extend(
+                [
+                    UNTRUSTED_INPUT_RULES,
+                    SILENT_IGNORE_INJECTION_RULES,
+                    UNTRUSTED_INPUT_FOLLOWUP_RULES,
+                ]
+            )
         if enable_antibait_guard:
             prompt_parts.append(ADVERSARIAL_REQUEST_RULES)
     else:
