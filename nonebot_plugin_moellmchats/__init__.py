@@ -2,7 +2,7 @@ import asyncio
 from collections import defaultdict
 
 import aiohttp
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageEvent, PrivateMessageEvent, GROUP
+from nonebot.adapters.onebot.v11 import GROUP, Bot, GroupMessageEvent, MessageEvent, PrivateMessageEvent
 from nonebot.plugin import PluginMetadata, require
 from nonebot.plugin.on import on_message
 from nonebot.rule import Rule
@@ -10,17 +10,17 @@ from nonebot.rule import Rule
 require("nonebot_plugin_localstore")
 
 from . import moe_llm as llm
-from .Config import config_parser
-from .ImageCache import image_cache
 from .access_control import evaluate_private_access, is_access_request_plugin_available, is_private_acl_exempt_user
-from .utils import format_message
+from .Config import config_parser
+from .group_access import group_has_superuser
+from .ImageCache import image_cache
 from .trigger_rules import contains_doubao_help_trigger, should_trigger_group_chat
-
+from .utils import format_message
 
 __plugin_meta__ = PluginMetadata(
     name="MoEllm聊天",
     description="Minimal QQ group chat bridge with context stitching and model tools.",
-    usage='艾特 bot 进行对话。',
+    usage="艾特 bot 进行对话。",
     type="application",
     homepage="https://github.com/Elflare/nonebot-plugin-moellmchats",
     supported_adapters={"~onebot.v11"},
@@ -35,7 +35,13 @@ def _session_key(event: MessageEvent) -> str:
         return f"group:{event.group_id}"
     return f"private:{event.user_id}"
 
-message_matcher = on_message(permission=GROUP, priority=1, block=False)
+
+message_matcher = on_message(
+    rule=Rule(group_has_superuser),
+    permission=GROUP,
+    priority=1,
+    block=False,
+)
 
 
 async def cache_message_images(event: GroupMessageEvent, message_dict: dict):
@@ -128,7 +134,11 @@ def _contains_doubao_help_trigger(message) -> bool:
 async def group_chat_trigger(bot: Bot, event: MessageEvent) -> bool:
     if not isinstance(event, GroupMessageEvent):
         return False
-    return should_trigger_group_chat(await at_me_only(bot, event), event.get_message().extract_plain_text())
+    should_trigger = should_trigger_group_chat(
+        await at_me_only(bot, event),
+        event.get_message().extract_plain_text(),
+    )
+    return should_trigger and await group_has_superuser(bot, event)
 
 
 def private_message_only(event: MessageEvent) -> bool:

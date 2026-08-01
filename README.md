@@ -129,6 +129,8 @@ LOCALSTORE_USE_CWD=True # 可选
 COMMAND_START=["/",""]  # 可选
 ```
 
+群聊 matcher 仅在至少一个 `SUPERUSERS` 账号是该群成员时运行。未配置超级用户、群内没有超级用户或成员列表查询失败时，插件会静默忽略群消息；私聊访问控制不受影响。
+
 ### 本插件主要配置
 
 由于文件较多，所以统一放在 `nonebot_plugin_localstore.get_plugin_config_dir()` 目录，具体参照[NoneBot Plugin LocalStore](https://github.com/nonebot/plugin-localstore)。<br>
