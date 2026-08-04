@@ -99,6 +99,26 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertIn("image_generation", tool_names)
         self.assertIn("image_edit", tool_names)
 
+    def test_imagegen_instructions_include_prompt_guidance_and_samples(self):
+        instructions = moe_llm.IMAGEGEN_TOOL_INSTRUCTIONS
+
+        self.assertIn("## Specificity policy", instructions)
+        self.assertIn("## Generate", instructions)
+        self.assertIn("### photorealistic-natural", instructions)
+        self.assertIn("## Edit", instructions)
+        self.assertIn("### identity-preserve", instructions)
+        self.assertIn("Plugin-specific image tool rules:", instructions)
+
+    def test_imagegen_instructions_exclude_unsupported_execution_controls(self):
+        instructions = moe_llm.IMAGEGEN_TOOL_INSTRUCTIONS
+
+        self.assertNotIn("`quality`", instructions)
+        self.assertNotIn("3840x2160", instructions)
+        self.assertNotIn("2160x3840", instructions)
+        self.assertNotIn("OPENAI_API_KEY", instructions)
+        self.assertNotIn("remove_chroma_key.py", instructions)
+        self.assertNotIn("background-extraction", instructions)
+
     def test_prompt_handler_reads_disabled_safeguards_config(self):
         llm = self.build_llm()
         moe_llm.context_dict[llm.session_key].extend(

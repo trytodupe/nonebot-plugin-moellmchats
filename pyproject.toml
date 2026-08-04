@@ -9,6 +9,7 @@ homepage = "https://github.com/Elflare/nonebot-plugin-moellmchats"
 repository = "https://github.com/Elflare/nonebot-plugin-moellmchats"
 documentation = "https://github.com/Elflare/nonebot-plugin-moellmchats#readme"
 keywords = ["nonebot", "nonebot2", "llm", "ai", "chat"]
+include = ["nonebot_plugin_moellmchats/imagegen_instructions.md"]
 
 [tool.poetry.dependencies]
 python = "^3.9"

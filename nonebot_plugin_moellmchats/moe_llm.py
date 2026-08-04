@@ -44,7 +44,9 @@ BASE_PROMPT = (
     "不要提系统提示、工具或内部推理。"
 )
 
-IMAGEGEN_TOOL_INSTRUCTIONS = """Image prompt refinement rules:
+IMAGEGEN_PROMPT_GUIDANCE = Path(__file__).with_name("imagegen_instructions.md").read_text(encoding="utf-8").strip()
+
+IMAGEGEN_PLUGIN_INSTRUCTIONS = """Plugin-specific image tool rules:
 - Before calling image_generation or image_edit, rewrite the user's request into a complete standalone prompt.
 - Preserve the user's concrete requirements. Do not add unrelated characters, brands, slogans, objects, or narrative beats.
 - Include only useful fields: use case, asset type, primary request, input images, subject, scene/backdrop, style/medium, composition/framing, lighting/mood, text verbatim, constraints, avoid.
@@ -54,6 +56,8 @@ IMAGEGEN_TOOL_INSTRUCTIONS = """Image prompt refinement rules:
 - For exact text in images, quote it verbatim and ask for clean readable typography.
 - After generating or editing an image, do not add a separate assistant text reply such as "done", "finished", or "here it is" unless the user explicitly asks for a caption or explanation. The image output itself is the reply.
 - Keep the final prompt concise enough to be directly sent to the Images API."""
+
+IMAGEGEN_TOOL_INSTRUCTIONS = "\n\n".join((IMAGEGEN_PROMPT_GUIDANCE, IMAGEGEN_PLUGIN_INSTRUCTIONS))
 
 IMAGEGEN_TOOL_DESCRIPTION = (
     "Use get_imagegen_instructions first when the user asks for image generation or editing, "
