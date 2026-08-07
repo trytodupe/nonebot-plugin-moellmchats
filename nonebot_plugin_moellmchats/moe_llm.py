@@ -1656,73 +1656,76 @@ class MoeLlm:
             )
 
         try:
-            async with client.responses.stream(**payload) as stream:
-                async for event in stream:
-                    event_type = getattr(event, "type", "")
-                    stream_event_counts[event_type] += 1
-                    # log_generation_candidate_event(event, event_type)
-                    if event_type == "response.output_text.delta":
-                        if delta := self._extract_stream_text_delta(event):
-                            streamed_text_chunks.append(delta)
-                    elif event_type == "response.output_item.added":
-                        item = getattr(event, "item", None)
-                        item_type = getattr(item, "type", "") if item is not None else ""
-                        if item_type == "image_generation_call":
-                            await self.send_generation_notice_event_once()
-                    elif event_type == "response.output_item.done":
-                        item = getattr(event, "item", None)
-                        item_type = getattr(item, "type", "") if item is not None else ""
-                        if item_type == "function_call":
-                            function_name = getattr(item, "name", None)
-                            streamed_function_calls.append(
-                                {
-                                    "type": "function_call",
-                                    "name": function_name,
-                                    "arguments": getattr(item, "arguments", None),
-                                }
-                            )
-                            if function_name == "get_imagegen_instructions":
+            if not self.model_info.get("stream", False):
+                final_response = await client.responses.create(**payload)
+            else:
+                async with client.responses.stream(**payload) as stream:
+                    async for event in stream:
+                        event_type = getattr(event, "type", "")
+                        stream_event_counts[event_type] += 1
+                        # log_generation_candidate_event(event, event_type)
+                        if event_type == "response.output_text.delta":
+                            if delta := self._extract_stream_text_delta(event):
+                                streamed_text_chunks.append(delta)
+                        elif event_type == "response.output_item.added":
+                            item = getattr(event, "item", None)
+                            item_type = getattr(item, "type", "") if item is not None else ""
+                            if item_type == "image_generation_call":
                                 await self.send_generation_notice_event_once()
-                        elif (
-                            item is not None
-                            and item_type == "image_generation_call"
-                            and getattr(item, "result", None)
+                        elif event_type == "response.output_item.done":
+                            item = getattr(event, "item", None)
+                            item_type = getattr(item, "type", "") if item is not None else ""
+                            if item_type == "function_call":
+                                function_name = getattr(item, "name", None)
+                                streamed_function_calls.append(
+                                    {
+                                        "type": "function_call",
+                                        "name": function_name,
+                                        "arguments": getattr(item, "arguments", None),
+                                    }
+                                )
+                                if function_name == "get_imagegen_instructions":
+                                    await self.send_generation_notice_event_once()
+                            elif (
+                                item is not None
+                                and item_type == "image_generation_call"
+                                and getattr(item, "result", None)
+                            ):
+                                item_id = getattr(item, "id", None) or f"output_{getattr(event, 'output_index', 0)}"
+                                streamed_image_calls[item_id] = {
+                                    "result": item.result,
+                                    "image_id": item_id,
+                                }
+                        elif event_type == "response.image_generation_call.partial_image":
+                            item_id = getattr(event, "item_id", None)
+                            partial_image_b64 = getattr(event, "partial_image_b64", None)
+                            if item_id and partial_image_b64:
+                                image_call = {
+                                    "result": partial_image_b64,
+                                    "image_id": item_id,
+                                }
+                                partial_image_calls[item_id] = image_call
+                                if item_id not in sent_stream_image_ids:
+                                    sent_stream_image_count += await self._send_generated_images([image_call])
+                                    sent_stream_image_ids.add(item_id)
+                        if (
+                            not self.generation_notice_sent
+                            and "image_generation_call" in event_type
                         ):
-                            item_id = getattr(item, "id", None) or f"output_{getattr(event, 'output_index', 0)}"
-                            streamed_image_calls[item_id] = {
-                                "result": item.result,
-                                "image_id": item_id,
+                            await self.send_generation_notice_event_once()
+                    try:
+                        final_response = await stream.get_final_response()
+                    except RuntimeError as exc:
+                        if "response.completed" not in str(exc):
+                            raise
+                        logger.warning(
+                            {
+                                "event": "responses_stream_incomplete",
+                                "error": str(exc),
+                                "event_counts": dict(stream_event_counts),
+                                "function_calls": streamed_function_calls,
                             }
-                    elif event_type == "response.image_generation_call.partial_image":
-                        item_id = getattr(event, "item_id", None)
-                        partial_image_b64 = getattr(event, "partial_image_b64", None)
-                        if item_id and partial_image_b64:
-                            image_call = {
-                                "result": partial_image_b64,
-                                "image_id": item_id,
-                            }
-                            partial_image_calls[item_id] = image_call
-                            if item_id not in sent_stream_image_ids:
-                                sent_stream_image_count += await self._send_generated_images([image_call])
-                                sent_stream_image_ids.add(item_id)
-                    if (
-                        not self.generation_notice_sent
-                        and "image_generation_call" in event_type
-                    ):
-                        await self.send_generation_notice_event_once()
-                try:
-                    final_response = await stream.get_final_response()
-                except RuntimeError as exc:
-                    if "response.completed" not in str(exc):
-                        raise
-                    logger.warning(
-                        {
-                            "event": "responses_stream_incomplete",
-                            "error": str(exc),
-                            "event_counts": dict(stream_event_counts),
-                            "function_calls": streamed_function_calls,
-                        }
-                    )
+                        )
         except Exception as exc:
             logger.error(traceback.format_exc())
             if sent_stream_image_count > 0:

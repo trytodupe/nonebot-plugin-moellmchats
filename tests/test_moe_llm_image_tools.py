@@ -5,7 +5,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from types import ModuleType
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 package = ModuleType("nonebot_plugin_moellmchats")
 package.__path__ = [str(Path(__file__).resolve().parents[1] / "nonebot_plugin_moellmchats")]
@@ -177,6 +177,7 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             "os.environ",
             {
                 "KITTY_WINDOW_ID": "2",
+                "TERM_PROGRAM": "kitty",
             },
             clear=False,
         ):
@@ -245,6 +246,76 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             llm._extract_function_args(merged, "get_imagegen_instructions"),
             [{}],
         )
+
+    def test_responses_api_honors_disabled_streaming(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "url": "https://example.com/v1/responses",
+            "key": "Bearer test-key",
+            "model": "test-model",
+            "stream": False,
+        }
+        llm.prompt = "test prompt"
+        llm.messages_handler.current_images = []
+        llm.messages_handler.post_process = MagicMock()
+
+        response_body = {
+            "id": "resp_test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '{"assistant_reply":"ok","image_memories":[]}',
+                        }
+                    ],
+                }
+            ],
+        }
+        response = SimpleNamespace(
+            model_dump=lambda **_kwargs: response_body,
+            output_text='{"assistant_reply":"ok","image_memories":[]}',
+        )
+        responses = SimpleNamespace(
+            create=AsyncMock(return_value=response),
+            stream=MagicMock(side_effect=AssertionError("stream transport used")),
+        )
+        client = SimpleNamespace(responses=responses, close=AsyncMock())
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        llm._build_responses_input = AsyncMock(return_value=[])
+        llm._send_text_response = AsyncMock()
+        llm._apply_image_memory_updates = MagicMock()
+        llm._sync_group_context_with_current_user_message = MagicMock()
+
+        with (
+            patch.object(moe_llm.aiohttp, "ClientSession", return_value=FakeSession(), create=True),
+            patch.object(moe_llm.aiohttp, "ClientTimeout", return_value=object(), create=True),
+            patch.object(moe_llm, "AsyncOpenAI", return_value=client),
+            patch.object(moe_llm.logger, "info", MagicMock()),
+        ):
+            result = asyncio.run(
+                llm.responses_llm_chat(
+                    llm.model_info["url"],
+                    {},
+                    [],
+                    None,
+                )
+            )
+
+        self.assertTrue(result)
+        responses.create.assert_awaited_once()
+        responses.stream.assert_not_called()
+        llm._send_text_response.assert_awaited_once_with("ok")
 
     def test_extracts_chat_tool_calls(self):
         llm = self.build_llm()
