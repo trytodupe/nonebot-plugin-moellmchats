@@ -1659,8 +1659,8 @@ class MoeLlm:
             if not self.model_info.get("stream", False):
                 final_response = await client.responses.create(**payload)
             else:
-                async with client.responses.stream(**payload) as stream:
-                    async for event in stream:
+                stream = await client.responses.create(**payload, stream=True)
+                async for event in stream:
                         event_type = getattr(event, "type", "")
                         stream_event_counts[event_type] += 1
                         # log_generation_candidate_event(event, event_type)
@@ -1713,19 +1713,17 @@ class MoeLlm:
                             and "image_generation_call" in event_type
                         ):
                             await self.send_generation_notice_event_once()
-                    try:
-                        final_response = await stream.get_final_response()
-                    except RuntimeError as exc:
-                        if "response.completed" not in str(exc):
-                            raise
-                        logger.warning(
-                            {
-                                "event": "responses_stream_incomplete",
-                                "error": str(exc),
-                                "event_counts": dict(stream_event_counts),
-                                "function_calls": streamed_function_calls,
-                            }
-                        )
+                        if event_type == "response.completed":
+                            final_response = getattr(event, "response", None)
+                if final_response is None:
+                    logger.warning(
+                        {
+                            "event": "responses_stream_incomplete",
+                            "error": "response.completed was not received",
+                            "event_counts": dict(stream_event_counts),
+                            "function_calls": streamed_function_calls,
+                        }
+                    )
         except Exception as exc:
             logger.error(traceback.format_exc())
             if sent_stream_image_count > 0:

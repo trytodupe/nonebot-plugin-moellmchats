@@ -234,7 +234,7 @@ your_absolute_path/
 新增字段说明：
 
 - `api_style`: `chat_completions` 或 `responses`。当设置为 `responses` 时，插件会改走 Responses API。
-- `stream`: 是否使用流式响应，同时适用于 `chat_completions` 和 `responses`；默认为 `false`。
+- `stream`: 是否使用流式响应，同时适用于 `chat_completions` 和 `responses`；默认为 `false`。Responses 流式响应直接消费原始事件，避免 SDK 状态累加器与兼容服务事件顺序不一致。
 - `use_native_web_search`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，并且总开关 `use_web_search = true`，插件将使用模型原生 `web_search` tool。
 - `use_external_image_generation`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，插件会暴露 `get_imagegen_instructions`、`image_generation` 和 `image_edit` 函数给模型。模型先获取 `$imagegen` 风格的 prompt 细化规则，再自行决定调用生成或编辑。
 - `external_image_generation`: 外部图片 API 配置。`generation_url` 默认为 `https://api.jucode.cn/v1/images/generations`，`edit_url` 默认由生成地址替换为 `/v1/images/edits`，`model` 默认为 `gpt-image-2`，`api_key_env` 默认为 `CODEX_API_KEY`。兼容旧的 `url` 字段作为生成地址。API key 只从环境变量读取，不要写进配置文件。
