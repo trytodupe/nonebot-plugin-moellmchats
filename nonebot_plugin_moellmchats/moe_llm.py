@@ -437,20 +437,21 @@ class MoeLlm:
             include.append("web_search_call.action.sources")
         if native_image_generation:
             tools.append({"type": "image_generation"})
-        tools.append(
-            {
-                "type": "function",
-                "name": "get_imagegen_instructions",
-                "description": "Return the $imagegen prompt-refinement instructions. Call this before using any native or external image generation/editing tool unless the same instructions were already fetched in this turn.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {},
-                    "required": [],
-                },
-                "strict": True,
-            }
-        )
+        if not self.imagegen_instructions_provided:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "get_imagegen_instructions",
+                    "description": "Return the $imagegen prompt-refinement instructions. Call this before using any native or external image generation/editing tool unless the same instructions were already fetched in this turn.",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {},
+                        "required": [],
+                    },
+                    "strict": True,
+                }
+            )
         if external_image_generation:
             tools.append(
                 {
@@ -566,20 +567,21 @@ class MoeLlm:
                     "strict": True,
                 }
             )
-        tools.append(
-            {
-                "type": "function",
-                "name": "get_imagegen_instructions",
-                "description": "Return the $imagegen prompt-refinement instructions. Call this before using any image generation/editing tool unless the same instructions were already fetched in this turn.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {},
-                    "required": [],
-                },
-                "strict": True,
-            }
-        )
+        if not self.imagegen_instructions_provided:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "get_imagegen_instructions",
+                    "description": "Return the $imagegen prompt-refinement instructions. Call this before using any image generation/editing tool unless the same instructions were already fetched in this turn.",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {},
+                        "required": [],
+                    },
+                    "strict": True,
+                }
+            )
         if external_image_generation:
             tools.append(
                 {
@@ -1776,33 +1778,51 @@ class MoeLlm:
                 local_image_cache=local_image_cache,
             )
         max_fetch_rounds = int(config_parser.get_config("fetch_recent_images_max_rounds") or 3)
-        if local_image_cache and self.fetch_recent_images_rounds < max_fetch_rounds:
+        if local_image_cache:
             fetch_args = self._extract_fetch_recent_images_args(body)
             if fetch_args:
                 if not self._can_use_group_image_cache():
                     return False
-                self.fetch_recent_images_rounds += 1
-                fetched_images = image_cache.get_recent_group_images(
-                    group_id=self.event.group_id,
-                    limit=fetch_args["limit"],
-                    offset=fetch_args["offset"],
-                )
-                known_image_ids = {image.get("image_id") for image in self.fetched_images}
-                self.fetched_images.extend(
-                    image
-                    for image in fetched_images
-                    if image.get("image_id") not in known_image_ids
-                )
-                if fetched_images:
-                    return await self.responses_llm_chat(
-                        url,
-                        headers,
-                        send_message_list,
-                        proxy,
-                        native_web_search=native_web_search,
-                        external_image_generation=external_image_generation,
-                        local_image_cache=True,
+                if self.fetch_recent_images_rounds < max_fetch_rounds:
+                    self.fetch_recent_images_rounds += 1
+                    fetched_images = image_cache.get_recent_group_images(
+                        group_id=self.event.group_id,
+                        limit=fetch_args["limit"],
+                        offset=fetch_args["offset"],
                     )
+                    known_image_ids = {image.get("image_id") for image in self.fetched_images}
+                    self.fetched_images.extend(
+                        image
+                        for image in fetched_images
+                        if image.get("image_id") not in known_image_ids
+                    )
+                    if fetched_images:
+                        return await self.responses_llm_chat(
+                            url,
+                            headers,
+                            send_message_list,
+                            proxy,
+                            native_web_search=native_web_search,
+                            external_image_generation=external_image_generation,
+                            local_image_cache=True,
+                        )
+                logger.info(
+                    {
+                        "event": "responses_fetch_final_answer",
+                        "fetch_rounds": self.fetch_recent_images_rounds,
+                        "max_fetch_rounds": max_fetch_rounds,
+                        "fetched_image_count": len(self.fetched_images),
+                    }
+                )
+                return await self.responses_llm_chat(
+                    url,
+                    headers,
+                    send_message_list,
+                    proxy,
+                    native_web_search=native_web_search,
+                    external_image_generation=external_image_generation,
+                    local_image_cache=False,
+                )
         if rerun_with_imagegen_instructions:
             return await self.responses_llm_chat(
                 url,

@@ -155,6 +155,11 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertNotIn("image_generation", tool_names)
         self.assertNotIn("image_edit", tool_names)
 
+        llm.imagegen_instructions_provided = True
+        tools, _include = llm._build_responses_tools()
+        tool_names = [tool.get("name") or tool.get("type") for tool in tools]
+        self.assertNotIn("get_imagegen_instructions", tool_names)
+
     def test_builds_chat_tools(self):
         llm = self.build_llm()
         tools = llm._build_chat_tools(external_image_generation=True, local_image_cache=True)
@@ -398,6 +403,93 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertTrue(responses.create.await_args.kwargs["stream"])
         responses.stream.assert_not_called()
         llm._send_text_response.assert_awaited_once_with("ok")
+
+    def test_responses_api_forces_final_answer_after_fetch_round_limit(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "url": "https://example.com/v1/responses",
+            "key": "Bearer test-key",
+            "model": "test-model",
+            "stream": False,
+        }
+        llm.prompt = "test prompt"
+        llm.fetch_recent_images_rounds = 3
+        llm.messages_handler.current_images = []
+        llm.messages_handler.post_process = MagicMock()
+
+        fetch_response = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "id": "resp_fetch",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "fetch_recent_images",
+                        "arguments": '{"limit":8,"offset":0}',
+                    }
+                ],
+            },
+            output_text="",
+        )
+        final_response = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "id": "resp_final",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": '{"assistant_reply":"final answer","image_memories":[]}',
+                            }
+                        ],
+                    }
+                ],
+            },
+            output_text='{"assistant_reply":"final answer","image_memories":[]}',
+        )
+        responses = SimpleNamespace(
+            create=AsyncMock(side_effect=[fetch_response, final_response]),
+        )
+        client = SimpleNamespace(responses=responses, close=AsyncMock())
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        llm._build_responses_input = AsyncMock(return_value=[])
+        llm._send_text_response = AsyncMock()
+        llm._apply_image_memory_updates = MagicMock()
+        llm._sync_group_context_with_current_user_message = MagicMock()
+
+        with (
+            patch.object(moe_llm.aiohttp, "ClientSession", return_value=FakeSession(), create=True),
+            patch.object(moe_llm.aiohttp, "ClientTimeout", return_value=object(), create=True),
+            patch.object(moe_llm, "AsyncOpenAI", return_value=client),
+            patch.object(moe_llm.logger, "info", MagicMock()),
+        ):
+            result = asyncio.run(
+                llm.responses_llm_chat(
+                    llm.model_info["url"],
+                    {},
+                    [],
+                    None,
+                    local_image_cache=True,
+                )
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(responses.create.await_count, 2)
+        first_tools = responses.create.await_args_list[0].kwargs["tools"]
+        second_tools = responses.create.await_args_list[1].kwargs["tools"]
+        self.assertIn("fetch_recent_images", [tool.get("name") for tool in first_tools])
+        self.assertNotIn("fetch_recent_images", [tool.get("name") for tool in second_tools])
+        llm._send_text_response.assert_awaited_once_with("final answer")
 
     def test_extracts_chat_tool_calls(self):
         llm = self.build_llm()
