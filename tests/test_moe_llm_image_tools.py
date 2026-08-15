@@ -176,6 +176,37 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             tools, _include = llm._build_responses_tools()
         self.assertNotIn("generate_image_with_gemini", [tool.get("name") for tool in tools])
 
+    def test_reads_vertex_credential_from_environment(self):
+        config = {
+            "credential_env": "VERTEX_AI_API_KEY",
+            "credential_file": "/tmp/Vertex-AI",
+        }
+        with (
+            patch.dict("os.environ", {"VERTEX_AI_API_KEY": " test-key "}),
+            patch.object(moe_llm.Path, "read_text", side_effect=AssertionError),
+        ):
+            api_key = moe_llm._read_vertex_api_key(config)
+
+        self.assertEqual(api_key, "test-key")
+
+    def test_falls_back_to_vertex_credential_file(self):
+        config = {
+            "credential_env": "VERTEX_AI_API_KEY",
+            "credential_file": "/tmp/Vertex-AI",
+        }
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                moe_llm,
+                "_configured_environment_value",
+                return_value="",
+            ),
+            patch.object(moe_llm.Path, "read_text", return_value=" file-key "),
+        ):
+            api_key = moe_llm._read_vertex_api_key(config)
+
+        self.assertEqual(api_key, "file-key")
+
     def test_executes_vertex_image_request_and_sends_metadata_message(self):
         llm = self.build_llm()
         llm._send_image_with_metadata = AsyncMock()

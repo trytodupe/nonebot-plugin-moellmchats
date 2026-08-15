@@ -153,7 +153,8 @@ COMMAND_START=["/",""]  # 可选
   safeguards_enabled: true, // 群聊 prompt safeguard 总开关：不可信输入、静默忽略 injection、injection follow-up。缺省为 true
   vertex_image_generation: {
     enabled: false,
-    credential_file: "/tmp/Vertex-AI", // Vertex API key 文件；不要把 key 写进 JSON
+    credential_env: "VERTEX_AI_API_KEY", // 从进程环境或 NoneBot .env 读取 API key
+    credential_file: "", // 可选的旧式凭据文件 fallback；不要把 key 写进 JSON
     allowed_group_ids: [], // 仅这些群会看到并能执行 Gemini 图片工具；私聊不开放
   },
   emotions_enabled: false, // 是否开启表情包（只有stream和is_segmemt为true才会发送表情包，模型设置中设置）
@@ -252,7 +253,7 @@ your_absolute_path/
 
 > 使用 `responses` + `is_vision = true` 时，插件会在**首次遇到某张图片**时下载并转成 base64 发送；后续相同图片会只保留成历史文本 `[image:summary]`，避免重复上传图片内容。
 
-`vertex_image_generation` 使用 Vertex AI `generateContent` REST 接口，支持 `gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image` 和 `gemini-2.5-flash-image`。只有白名单群会向 LLM 暴露 `generate_image_with_gemini`；执行时会再次检查群号。普通图片请求仍默认使用 OpenAI，用户明确要求 Google、Gemini 或具体 Gemini 图片模型时才调用 Vertex。图片生成结果以一条 QQ 消息发送：图片、模型名和实际像素 scale。
+`vertex_image_generation` 使用 Vertex AI `generateContent` REST 接口，支持 `gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image` 和 `gemini-2.5-flash-image`。API key 应写入 NoneBot 项目的 `.env`（例如 `VERTEX_AI_API_KEY=...`），JSON 中只保存 `credential_env` 名称；仍可用 `credential_file` 作为 fallback。只有白名单群会向 LLM 暴露 `generate_image_with_gemini`；执行时会再次检查群号。普通图片请求仍默认使用 OpenAI，用户明确要求 Google、Gemini 或具体 Gemini 图片模型时才调用 Vertex。图片生成结果以一条 QQ 消息发送：图片、模型名和实际像素 scale。
 
 #### 智能调度配置 `model_config.json`(指令维护)<br>
 

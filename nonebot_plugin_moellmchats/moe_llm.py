@@ -79,6 +79,35 @@ IMAGEGEN_TOOL_DESCRIPTION = (
 )
 
 
+def _configured_environment_value(name: str) -> str:
+    value = os.getenv(name)
+    if value:
+        return value.strip()
+    try:
+        from nonebot import get_driver
+
+        value = getattr(get_driver().config, name.lower(), "")
+    except (ImportError, RuntimeError):
+        return ""
+    return str(value).strip() if value else ""
+
+
+def _read_vertex_api_key(config: dict) -> str:
+    credential_env = str(config.get("credential_env") or "").strip()
+    if credential_env:
+        api_key = _configured_environment_value(credential_env)
+        if api_key:
+            return api_key
+
+    credential_file = str(config.get("credential_file") or "").strip()
+    if not credential_file:
+        return ""
+    try:
+        return Path(credential_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 class MoeLlm:
     def __init__(
         self,
@@ -1175,15 +1204,9 @@ class MoeLlm:
         if not self._can_use_vertex_image_generation():
             return "当前会话不能使用 Vertex 图片生成。"
         config = self._vertex_image_generation_config()
-        credential_file = Path(
-            str(config.get("credential_file") or "/tmp/Vertex-AI")
-        )
-        try:
-            api_key = credential_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            return "Vertex 图片生成凭据不可用。"
+        api_key = _read_vertex_api_key(config)
         if not api_key:
-            return "Vertex 图片生成凭据为空。"
+            return "Vertex 图片生成凭据不可用。"
 
         base_url = str(
             config.get("base_url")

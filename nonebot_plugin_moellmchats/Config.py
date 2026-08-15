@@ -38,7 +38,8 @@ class ConfigParser:
                 "fetch_recent_images_max_rounds": 3,
                 "vertex_image_generation": {
                     "enabled": False,
-                    "credential_file": "/tmp/Vertex-AI",
+                    "credential_env": "VERTEX_AI_API_KEY",
+                    "credential_file": "",
                     "allowed_group_ids": [],
                 },
             }
