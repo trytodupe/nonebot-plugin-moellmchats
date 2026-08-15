@@ -151,6 +151,11 @@ COMMAND_START=["/",""]  # 可选
   search_api: "Bearer your_tavily_key", // 旧版 Tavily 联网搜索 key。若使用 Responses API + native web_search，可留空
   fastai_enabled: false, // 快速AI助手开关。方便快速调用纯AI助手，无角色扮演。调用快速AI助手时，仅有用户上下文，不会有群聊上下文。不会分段发送也不会发表情包。调用方法下文提到。
   safeguards_enabled: true, // 群聊 prompt safeguard 总开关：不可信输入、静默忽略 injection、injection follow-up。缺省为 true
+  vertex_image_generation: {
+    enabled: false,
+    credential_file: "/tmp/Vertex-AI", // Vertex API key 文件；不要把 key 写进 JSON
+    allowed_group_ids: [], // 仅这些群会看到并能执行 Gemini 图片工具；私聊不开放
+  },
   emotions_enabled: false, // 是否开启表情包（只有stream和is_segmemt为true才会发送表情包，模型设置中设置）
   emotion_rate: 0.1, // 发送表情包概率（0-1）（经测试 LLM 几乎每句都会发送表情包，所以手动设置概率）
   emotions_dir: "absolute path", // 表情包目录，绝对路径
@@ -217,6 +222,8 @@ your_absolute_path/
     "api_style": "responses", // 使用 Responses API
     "is_vision": true,
     "use_native_web_search": true, // 开启后，插件会使用 OpenAI 原生 web_search tool，而不是 Tavily
+    "use_native_image_generation": true,
+    "native_image_generation_model": "gpt-image-2", // 用户可见的实际图片模型名
     "use_external_image_generation": true, // 开启后，插件会让模型调用外部图片生成/编辑函数，而不是 Responses 原生 image_generation tool
     "external_image_generation": {
       "generation_url": "https://api.jucode.cn/v1/images/generations",
@@ -236,12 +243,16 @@ your_absolute_path/
 - `api_style`: `chat_completions` 或 `responses`。当设置为 `responses` 时，插件会改走 Responses API。
 - `stream`: 是否使用流式响应，同时适用于 `chat_completions` 和 `responses`；默认为 `false`。Responses 流式响应直接消费原始事件，避免 SDK 状态累加器与兼容服务事件顺序不一致。
 - `use_native_web_search`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，并且总开关 `use_web_search = true`，插件将使用模型原生 `web_search` tool。
+- `use_native_image_generation`: 暴露 Responses 原生 `image_generation` tool，同时暴露可选的 `set_openai_image_size`，让 LLM 在需要时选择 `auto` 或合规的 `WIDTHxHEIGHT`。兼容 provider 可能近似而非严格执行请求尺寸，因此回复显示实际图片像素。
+- `native_image_generation_model`: 图片回复中显示的原生图片模型名，缺省为 `gpt-image-2`。
 - `use_external_image_generation`: 仅在 `api_style = "responses"` 时有意义。若为 `true`，插件会暴露 `get_imagegen_instructions`、`image_generation` 和 `image_edit` 函数给模型。模型先获取 `$imagegen` 风格的 prompt 细化规则，再自行决定调用生成或编辑。
 - `external_image_generation`: 外部图片 API 配置。`generation_url` 默认为 `https://api.jucode.cn/v1/images/generations`，`edit_url` 默认由生成地址替换为 `/v1/images/edits`，`model` 默认为 `gpt-image-2`，`api_key_env` 默认为 `CODEX_API_KEY`。兼容旧的 `url` 字段作为生成地址。API key 只从环境变量读取，不要写进配置文件。
 - `reasoning_effort`: 可选，透传给 Responses API 的 `reasoning.effort`。
 - `verbosity`: 可选，仅在 `api_style = "responses"` 时生效，透传给 Responses API 的 `text.verbosity`。群聊回复若嫌太像标准答案，建议设为 `low`。
 
 > 使用 `responses` + `is_vision = true` 时，插件会在**首次遇到某张图片**时下载并转成 base64 发送；后续相同图片会只保留成历史文本 `[image:summary]`，避免重复上传图片内容。
+
+`vertex_image_generation` 使用 Vertex AI `generateContent` REST 接口，支持 `gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image` 和 `gemini-2.5-flash-image`。只有白名单群会向 LLM 暴露 `generate_image_with_gemini`；执行时会再次检查群号。普通图片请求仍默认使用 OpenAI，用户明确要求 Google、Gemini 或具体 Gemini 图片模型时才调用 Vertex。图片生成结果以一条 QQ 消息发送：图片、模型名和实际像素 scale。
 
 #### 智能调度配置 `model_config.json`(指令维护)<br>
 

@@ -20,6 +20,18 @@ from .ImageCache import image_cache
 from .ImageMemory import image_memory_store
 from .MessagesHandler import MessagesHandler
 from .ModelSelector import model_selector
+from .image_generation import (
+    OPENAI_IMAGE_SIZE_DEFAULT,
+    OPENAI_IMAGE_SIZE_EXAMPLES,
+    VERTEX_IMAGE_MODELS,
+    VERTEX_IMAGE_PROFILES,
+    VERTEX_IMAGE_TOOL_DESCRIPTION,
+    actual_image_scale,
+    build_vertex_image_payload,
+    extract_vertex_images,
+    normalize_openai_image_size,
+    normalize_vertex_image_request,
+)
 from .response_utils import (
     build_image_reference,
     detect_image_media_type,
@@ -90,6 +102,8 @@ class MoeLlm:
         self.image_inputs_by_id = {}
         self.imagegen_instructions_provided = False
         self.generation_notice_sent = False
+        self.native_image_size = OPENAI_IMAGE_SIZE_DEFAULT
+        self.native_image_size_selected = False
         self.session_key = self._build_session_key()
 
     def _build_session_key(self) -> str:
@@ -106,9 +120,9 @@ class MoeLlm:
         reply_segment = self._reply_segment()
         if reply_segment is None:
             return content
-        if isinstance(content, MessageSegment):
-            return reply_segment + content
-        return reply_segment + MessageSegment.text(str(content))
+        if isinstance(content, str):
+            content = MessageSegment.text(content)
+        return reply_segment + content
 
     async def send_reply_message(self, content):
         await self.bot.send(self.event, self.build_reply_message(content))
@@ -185,6 +199,25 @@ class MoeLlm:
 
     def _use_external_image_generation(self) -> bool:
         return bool(self.model_info.get("use_external_image_generation"))
+
+    def _native_image_model_label(self) -> str:
+        return str(
+            self.model_info.get("native_image_generation_model") or "gpt-image-2"
+        ).strip()
+
+    def _vertex_image_generation_config(self) -> dict:
+        return config_parser.get_config("vertex_image_generation") or {}
+
+    def _can_use_vertex_image_generation(self) -> bool:
+        config = self._vertex_image_generation_config()
+        if not config.get("enabled") or not hasattr(self.event, "group_id"):
+            return False
+        allowed_group_ids = {
+            str(group_id).strip()
+            for group_id in config.get("allowed_group_ids") or []
+            if str(group_id).strip()
+        }
+        return str(self.event.group_id) in allowed_group_ids
 
     def _external_image_generation_config(self) -> dict:
         return self.model_info.get("external_image_generation") or {}
@@ -436,7 +469,31 @@ class MoeLlm:
             tools.append({"type": "web_search"})
             include.append("web_search_call.action.sources")
         if native_image_generation:
-            tools.append({"type": "image_generation"})
+            if not self.native_image_size_selected:
+                tools.append(
+                    {
+                        "type": "function",
+                        "name": "set_openai_image_size",
+                        "description": "Select the native OpenAI image output size before calling image_generation when the user requests a size, resolution, aspect ratio, portrait, or landscape output. The provider may approximate the requested pixels. Skip this function when automatic sizing is acceptable.",
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "size": {
+                                    "type": "string",
+                                    "description": "Use auto or WIDTHxHEIGHT. Both edges must be multiples of 16, each edge at most 3840, aspect ratio from 1:3 through 3:1, and total pixels from 655360 through 8294400. Common choices: "
+                                    + ", ".join(OPENAI_IMAGE_SIZE_EXAMPLES),
+                                }
+                            },
+                            "required": ["size"],
+                        },
+                        "strict": True,
+                    }
+                )
+            native_image_tool = {"type": "image_generation"}
+            if self.native_image_size_selected:
+                native_image_tool["size"] = self.native_image_size
+            tools.append(native_image_tool)
         if not self.imagegen_instructions_provided:
             tools.append(
                 {
@@ -510,6 +567,57 @@ class MoeLlm:
                             },
                         },
                         "required": ["prompt", "image_ids", "size", "n"],
+                    },
+                    "strict": True,
+                }
+            )
+        if self._can_use_vertex_image_generation():
+            all_aspect_ratios = sorted(
+                {
+                    ratio
+                    for profile in VERTEX_IMAGE_PROFILES.values()
+                    for ratio in profile.aspect_ratios
+                }
+            )
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "generate_image_with_gemini",
+                    "description": VERTEX_IMAGE_TOOL_DESCRIPTION + " " + IMAGEGEN_TOOL_DESCRIPTION,
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Complete standalone generation or edit prompt.",
+                            },
+                            "model": {
+                                "type": "string",
+                                "enum": list(VERTEX_IMAGE_MODELS),
+                            },
+                            "aspect_ratio": {
+                                "type": "string",
+                                "enum": all_aspect_ratios,
+                            },
+                            "image_size": {
+                                "type": "string",
+                                "enum": ["512", "1K", "2K", "4K"],
+                                "description": "Requested scale. For gemini-2.5-flash-image this value is ignored because that model selects its own size.",
+                            },
+                            "image_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Zero to 14 image IDs from current attachments, fetched recent images, or fetched avatars.",
+                            },
+                        },
+                        "required": [
+                            "prompt",
+                            "model",
+                            "aspect_ratio",
+                            "image_size",
+                            "image_ids",
+                        ],
                     },
                     "strict": True,
                 }
@@ -1014,7 +1122,26 @@ class MoeLlm:
             }
         return None
 
-    async def _send_generated_images(self, image_calls: list[dict]) -> int:
+    async def _send_image_with_metadata(
+        self,
+        image_bytes: bytes,
+        *,
+        model: str,
+        scale: str,
+    ) -> None:
+        actual_scale = actual_image_scale(image_bytes, scale)
+        message = MessageSegment.image(image_bytes) + MessageSegment.text(
+            f"\n模型：{model} · Scale：{actual_scale}"
+        )
+        await self.send_reply_message(message)
+
+    async def _send_generated_images(
+        self,
+        image_calls: list[dict],
+        *,
+        model: str | None = None,
+        scale: str | None = None,
+    ) -> int:
         sent_count = 0
         for image_call in image_calls:
             image_base64 = image_call.get("result")
@@ -1025,8 +1152,102 @@ class MoeLlm:
             except Exception:
                 logger.warning("Failed to decode generated image")
                 continue
-            await self.send_reply_message(MessageSegment.image(image_bytes))
+            await self._send_image_with_metadata(
+                image_bytes,
+                model=model or self._native_image_model_label(),
+                scale=scale or self.native_image_size,
+            )
             sent_count += 1
+        return sent_count
+
+    def _extract_vertex_image_requests(self, response: dict) -> list[dict]:
+        requests = []
+        for arguments in self._extract_function_args(
+            response, "generate_image_with_gemini"
+        ):
+            if request := normalize_vertex_image_request(arguments):
+                requests.append(request)
+        return requests
+
+    async def _generate_vertex_images(self, requests: list[dict]) -> int | str:
+        if not requests:
+            return 0
+        if not self._can_use_vertex_image_generation():
+            return "当前会话不能使用 Vertex 图片生成。"
+        config = self._vertex_image_generation_config()
+        credential_file = Path(
+            str(config.get("credential_file") or "/tmp/Vertex-AI")
+        )
+        try:
+            api_key = credential_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return "Vertex 图片生成凭据不可用。"
+        if not api_key:
+            return "Vertex 图片生成凭据为空。"
+
+        base_url = str(
+            config.get("base_url")
+            or "https://aiplatform.googleapis.com/v1/publishers/google/models"
+        ).rstrip("/")
+        timeout = int(config.get("timeout") or 300)
+        sent_count = 0
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as session:
+            for request in requests:
+                missing_image_ids = [
+                    image_id
+                    for image_id in request["image_ids"]
+                    if image_id not in self.image_inputs_by_id
+                ]
+                if missing_image_ids:
+                    return "Vertex 图片生成缺少可用输入图：" + ", ".join(
+                        missing_image_ids
+                    )
+                payload = build_vertex_image_payload(
+                    request, self.image_inputs_by_id
+                )
+                url = f"{base_url}/{request['model']}:generateContent"
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    ssl=False,
+                ) as response:
+                    response_text = await response.text()
+                    if response.status >= 400:
+                        logger.warning(
+                            {
+                                "event": "vertex_image_generation_failed",
+                                "model": request["model"],
+                                "status": response.status,
+                                "body": response_text[:1000],
+                            }
+                        )
+                        return self._format_image_api_error(
+                            "Vertex 图片生成", response.status, response_text
+                        )
+                    try:
+                        body = json.loads(response_text)
+                    except ValueError:
+                        return "Vertex 图片生成响应解析失败。"
+                    images = extract_vertex_images(body)
+                    if not images:
+                        return "Vertex 图片生成未返回图片。"
+                    requested_scale = request["image_size"]
+                    if requested_scale == "MODEL_SELECTED":
+                        requested_scale = request["aspect_ratio"]
+                    for image_bytes in images:
+                        await self._send_image_with_metadata(
+                            image_bytes,
+                            model=request["model"],
+                            scale=requested_scale,
+                        )
+                        sent_count += 1
         return sent_count
 
     async def _handle_chat_tool_calls(
@@ -1686,7 +1907,11 @@ class MoeLlm:
                                         "arguments": getattr(item, "arguments", None),
                                     }
                                 )
-                                if function_name == "get_imagegen_instructions":
+                                if function_name in {
+                                    "get_imagegen_instructions",
+                                    "set_openai_image_size",
+                                    "generate_image_with_gemini",
+                                }:
                                     await self.send_generation_notice_event_once()
                             elif (
                                 item is not None
@@ -1707,9 +1932,6 @@ class MoeLlm:
                                     "image_id": item_id,
                                 }
                                 partial_image_calls[item_id] = image_call
-                                if item_id not in sent_stream_image_ids:
-                                    sent_stream_image_count += await self._send_generated_images([image_call])
-                                    sent_stream_image_ids.add(item_id)
                         if (
                             not self.generation_notice_sent
                             and "image_generation_call" in event_type
@@ -1728,7 +1950,10 @@ class MoeLlm:
                     )
         except Exception as exc:
             logger.error(traceback.format_exc())
-            if sent_stream_image_count > 0:
+            if partial_image_calls:
+                await self._send_generated_images(
+                    list(partial_image_calls.values())
+                )
                 return True
             return self._format_upstream_error(exc)
         finally:
@@ -1755,6 +1980,14 @@ class MoeLlm:
         if rerun_with_imagegen_instructions:
             await self.send_generation_notice_event_once()
             self.imagegen_instructions_provided = True
+        size_requests = self._extract_function_args(body, "set_openai_image_size")
+        rerun_with_native_image_size = bool(size_requests) and not self.native_image_size_selected
+        if rerun_with_native_image_size:
+            await self.send_generation_notice_event_once()
+            self.native_image_size = normalize_openai_image_size(
+                size_requests[-1].get("size")
+            )
+            self.native_image_size_selected = True
         avatar_args = self._extract_function_args(body, "fetch_user_avatar")
         known_avatar_refs = {
             str(item.get("user_ref"))
@@ -1823,7 +2056,7 @@ class MoeLlm:
                     external_image_generation=external_image_generation,
                     local_image_cache=False,
                 )
-        if rerun_with_imagegen_instructions:
+        if rerun_with_imagegen_instructions or rerun_with_native_image_size:
             return await self.responses_llm_chat(
                 url,
                 headers,
@@ -1835,9 +2068,15 @@ class MoeLlm:
             )
         generate_image_args = self._extract_image_generation_args(body)
         edit_image_args = self._extract_image_edit_args(body)
+        vertex_image_requests = self._extract_vertex_image_requests(body)
         external_sent_images = 0
-        if generate_image_args or edit_image_args:
+        if generate_image_args or edit_image_args or vertex_image_requests:
             await self.send_generation_notice_event_once()
+        if vertex_image_requests:
+            generated = await self._generate_vertex_images(vertex_image_requests)
+            if isinstance(generated, str):
+                return generated
+            external_sent_images += generated
         if edit_image_args:
             edited = await self._edit_external_images(edit_image_args)
             if isinstance(edited, str):

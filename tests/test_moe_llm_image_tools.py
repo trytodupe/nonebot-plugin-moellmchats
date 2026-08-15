@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import unittest
 import json
 from importlib.util import module_from_spec, spec_from_file_location
@@ -144,6 +145,112 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertEqual(include, [])
         self.assertIn("image_generation", tool_names)
         self.assertIn("get_imagegen_instructions", tool_names)
+        self.assertIn("set_openai_image_size", tool_names)
+        native_tool = next(tool for tool in tools if tool.get("type") == "image_generation")
+        self.assertNotIn("size", native_tool)
+
+    def test_builds_native_tool_with_llm_selected_size(self):
+        llm = self.build_llm()
+        llm.native_image_size = "1536x1024"
+        llm.native_image_size_selected = True
+
+        tools, _include = llm._build_responses_tools(native_image_generation=True)
+
+        self.assertNotIn("set_openai_image_size", [tool.get("name") for tool in tools])
+        native_tool = next(tool for tool in tools if tool.get("type") == "image_generation")
+        self.assertEqual(native_tool["size"], "1536x1024")
+
+    def test_exposes_vertex_tool_only_in_allowed_group(self):
+        llm = self.build_llm()
+        config = {
+            "enabled": True,
+            "allowed_group_ids": [2],
+            "credential_file": "/tmp/Vertex-AI",
+        }
+        with patch.object(moe_llm.config_parser, "get_config", return_value=config):
+            tools, _include = llm._build_responses_tools()
+        self.assertIn("generate_image_with_gemini", [tool.get("name") for tool in tools])
+
+        llm.event.group_id = 3
+        with patch.object(moe_llm.config_parser, "get_config", return_value=config):
+            tools, _include = llm._build_responses_tools()
+        self.assertNotIn("generate_image_with_gemini", [tool.get("name") for tool in tools])
+
+    def test_executes_vertex_image_request_and_sends_metadata_message(self):
+        llm = self.build_llm()
+        llm._send_image_with_metadata = AsyncMock()
+        image_bytes = b"vertex-image"
+        response_body = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/jpeg",
+                                    "data": base64.b64encode(image_bytes).decode(),
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def text(self):
+                return json.dumps(response_body)
+
+        class FakeSession:
+            def __init__(self):
+                self.post_args = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, *args, **kwargs):
+                self.post_args = (args, kwargs)
+                return FakeResponse()
+
+        config = {
+            "enabled": True,
+            "credential_file": "/tmp/Vertex-AI",
+            "allowed_group_ids": [2],
+        }
+        session = FakeSession()
+        request = {
+            "prompt": "draw it",
+            "model": "gemini-3.1-flash-image",
+            "aspect_ratio": "16:9",
+            "image_size": "2K",
+            "image_ids": [],
+        }
+        with (
+            patch.object(moe_llm.config_parser, "get_config", return_value=config),
+            patch.object(moe_llm.Path, "read_text", return_value="test-key"),
+            patch.object(moe_llm.aiohttp, "ClientSession", return_value=session, create=True),
+            patch.object(moe_llm.aiohttp, "ClientTimeout", return_value=object(), create=True),
+        ):
+            sent = asyncio.run(llm._generate_vertex_images([request]))
+
+        self.assertEqual(sent, 1)
+        self.assertTrue(session.post_args[0][0].endswith("/gemini-3.1-flash-image:generateContent"))
+        llm._send_image_with_metadata.assert_awaited_once_with(
+            image_bytes,
+            model="gemini-3.1-flash-image",
+            scale="2K",
+        )
 
     def test_exposes_imagegen_instructions_without_external_image_tools(self):
         llm = self.build_llm()
@@ -321,6 +428,94 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         responses.create.assert_awaited_once()
         responses.stream.assert_not_called()
         llm._send_text_response.assert_awaited_once_with("ok")
+
+    def test_responses_api_reruns_with_llm_selected_native_image_size(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "url": "https://example.com/v1/responses",
+            "key": "Bearer test-key",
+            "model": "test-model",
+            "stream": False,
+            "use_native_image_generation": True,
+        }
+        llm.prompt = "test prompt"
+        llm.messages_handler.current_images = []
+        llm.messages_handler.post_process = MagicMock()
+
+        size_response = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "id": "resp_size",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "set_openai_image_size",
+                        "arguments": '{"size":"1536x1024"}',
+                    }
+                ],
+            },
+            output_text="",
+        )
+        final_response = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "id": "resp_final",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": '{"assistant_reply":"ok","image_memories":[]}',
+                            }
+                        ],
+                    }
+                ],
+            },
+            output_text='{"assistant_reply":"ok","image_memories":[]}',
+        )
+        responses = SimpleNamespace(
+            create=AsyncMock(side_effect=[size_response, final_response]),
+        )
+        client = SimpleNamespace(responses=responses, close=AsyncMock())
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        llm._build_responses_input = AsyncMock(return_value=[])
+        llm._send_text_response = AsyncMock()
+        llm._apply_image_memory_updates = MagicMock()
+        llm._sync_group_context_with_current_user_message = MagicMock()
+        llm.send_generation_notice_event_once = AsyncMock()
+
+        with (
+            patch.object(moe_llm.aiohttp, "ClientSession", return_value=FakeSession(), create=True),
+            patch.object(moe_llm.aiohttp, "ClientTimeout", return_value=object(), create=True),
+            patch.object(moe_llm, "AsyncOpenAI", return_value=client),
+            patch.object(moe_llm.logger, "info", MagicMock()),
+        ):
+            result = asyncio.run(
+                llm.responses_llm_chat(
+                    llm.model_info["url"],
+                    {},
+                    [],
+                    None,
+                )
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(responses.create.await_count, 2)
+        first_tools = responses.create.await_args_list[0].kwargs["tools"]
+        second_tools = responses.create.await_args_list[1].kwargs["tools"]
+        self.assertIn("set_openai_image_size", [tool.get("name") for tool in first_tools])
+        self.assertNotIn("set_openai_image_size", [tool.get("name") for tool in second_tools])
+        native_tool = next(tool for tool in second_tools if tool.get("type") == "image_generation")
+        self.assertEqual(native_tool["size"], "1536x1024")
 
     def test_responses_api_streams_without_sdk_accumulator(self):
         llm = self.build_llm()
@@ -683,6 +878,35 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             [
                 ("reply", {"id": 42}),
                 ("image", {"file": b"img"}),
+            ],
+        )
+
+    def test_send_generated_image_includes_model_and_actual_scale_in_one_message(self):
+        bot = SimpleNamespace(send=AsyncMock())
+        llm = MoeLlm(
+            bot=bot,
+            event=SimpleNamespace(user_id=1, group_id=2, message_id=42),
+            format_message_dict={},
+        )
+        llm.messages_handler = SimpleNamespace(user_refs=[])
+        png_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + (1024).to_bytes(4, "big") + (768).to_bytes(4, "big")
+
+        sent = asyncio.run(
+            llm._send_generated_images(
+                [{"result": base64.b64encode(png_header).decode()}],
+                model="gpt-image-2",
+                scale="auto",
+            )
+        )
+
+        self.assertEqual(sent, 1)
+        _event, message = bot.send.await_args.args
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in message.segments],
+            [
+                ("reply", {"id": 42}),
+                ("image", {"file": png_header}),
+                ("text", {"text": "\n模型：gpt-image-2 · Scale：1024x768"}),
             ],
         )
 

@@ -36,6 +36,11 @@ class ConfigParser:
                 "fetch_recent_images_default_limit": 6,
                 "fetch_recent_images_max_limit": 10,
                 "fetch_recent_images_max_rounds": 3,
+                "vertex_image_generation": {
+                    "enabled": False,
+                    "credential_file": "/tmp/Vertex-AI",
+                    "allowed_group_ids": [],
+                },
             }
             with open(self.filepath, "w", encoding="utf-8") as file:
                 json.dump(config, file, indent=4, ensure_ascii=False)
