@@ -129,7 +129,7 @@ LOCALSTORE_USE_CWD=True # 可选
 COMMAND_START=["/",""]  # 可选
 ```
 
-群聊 matcher 仅在至少一个 `SUPERUSERS` 账号是该群成员时运行。未配置超级用户、群内没有超级用户或成员列表查询失败时，插件会静默忽略群消息；私聊访问控制不受影响。
+`group_gate_mode` 控制可选的 `group_superuser_gate` 插件：`auto` 在 gate 已加载时使用、缺失时保持原行为；`required` 在 gate 缺失或 interface 不兼容时拒绝启动；`off` 明确禁用。gate 启用后，群聊 matcher 仅在至少一个 `SUPERUSERS` 账号是该群成员时运行；私聊访问控制不受影响。
 
 ### 本插件主要配置
 
@@ -151,6 +151,7 @@ COMMAND_START=["/",""]  # 可选
   search_api: "Bearer your_tavily_key", // 旧版 Tavily 联网搜索 key。若使用 Responses API + native web_search，可留空
   fastai_enabled: false, // 快速AI助手开关。方便快速调用纯AI助手，无角色扮演。调用快速AI助手时，仅有用户上下文，不会有群聊上下文。不会分段发送也不会发表情包。调用方法下文提到。
   safeguards_enabled: true, // 群聊 prompt safeguard 总开关：不可信输入、静默忽略 injection、injection follow-up。缺省为 true
+  group_gate_mode: "auto", // 可选共享群门禁模式：auto / required / off
   vertex_image_generation: {
     enabled: false,
     credential_env: "VERTEX_AI_API_KEY", // 从进程环境或 NoneBot .env 读取 API key

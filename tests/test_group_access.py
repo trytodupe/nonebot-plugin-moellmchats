@@ -5,17 +5,17 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-nonebot_module = sys.modules.get("nonebot") or ModuleType("nonebot")
-nonebot_module.get_driver = lambda: SimpleNamespace(config=SimpleNamespace(superusers=set()))
-sys.modules["nonebot"] = nonebot_module
-sys.modules.setdefault(
-    "nonebot.adapters.onebot.v11",
-    SimpleNamespace(Bot=object, MessageEvent=object),
+nonebot_log_module = sys.modules.get("nonebot.log") or ModuleType("nonebot.log")
+nonebot_log_module.logger = SimpleNamespace(
+    info=lambda *args, **kwargs: None,
+    success=lambda *args, **kwargs: None,
 )
-sys.modules.setdefault(
-    "nonebot.log",
-    SimpleNamespace(logger=SimpleNamespace(warning=lambda *args, **kwargs: None)),
-)
+sys.modules["nonebot.log"] = nonebot_log_module
+
+nonebot_plugin_module = sys.modules.get("nonebot.plugin") or ModuleType("nonebot.plugin")
+nonebot_plugin_module.get_plugin = lambda _name: None
+nonebot_plugin_module.get_loaded_plugins = lambda: set()
+sys.modules["nonebot.plugin"] = nonebot_plugin_module
 
 module_path = Path(__file__).resolve().parents[1] / "nonebot_plugin_moellmchats" / "group_access.py"
 spec = spec_from_file_location("nonebot_plugin_moellmchats.group_access", module_path)
@@ -24,56 +24,67 @@ assert spec.loader is not None
 spec.loader.exec_module(group_access)
 
 
-class FakeGroupMessageEvent:
-    def __init__(self, group_id=200, message_id=300):
-        self.group_id = group_id
-        self.message_id = message_id
+def gate_plugin(gate, version=1):
+    return SimpleNamespace(
+        name="group_superuser_gate",
+        module_name="group_superuser_gate",
+        module=SimpleNamespace(
+            GROUP_SUPERUSER_GATE_INTERFACE_VERSION=version,
+            group_has_superuser=gate,
+        ),
+    )
 
 
 class GroupAccessTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        group_access._event_access_cache.clear()
-        self.bot = SimpleNamespace(
-            self_id=100,
-            get_group_member_list=AsyncMock(),
-        )
+        group_access._group_gate = None
 
-    async def _check(self, event=None, superusers=None):
-        event = event or FakeGroupMessageEvent()
-        superusers = {"10", "20"} if superusers is None else superusers
-        with patch.object(
-            group_access,
-            "get_driver",
-            return_value=SimpleNamespace(config=SimpleNamespace(superusers=superusers)),
+    async def test_auto_mode_uses_loaded_gate(self):
+        gate = AsyncMock(return_value=False)
+        with patch.object(group_access, "get_plugin", return_value=gate_plugin(gate)):
+            group_access.configure_group_gate("auto")
+
+        bot = object()
+        event = SimpleNamespace(group_id=200)
+        assert not await group_access.group_has_superuser(bot, event)
+        gate.assert_awaited_once_with(bot, event)
+
+    async def test_auto_mode_allows_groups_without_gate(self):
+        with (
+            patch.object(group_access, "get_plugin", return_value=None),
+            patch.object(group_access, "get_loaded_plugins", return_value=set()),
         ):
-            return await group_access.group_has_superuser(self.bot, event)
+            group_access.configure_group_gate("auto")
 
-    async def test_allows_group_with_configured_superuser_member(self):
-        self.bot.get_group_member_list.return_value = [
-            {"user_id": 9},
-            {"user_id": 20},
-        ]
+        assert await group_access.group_has_superuser(object(), SimpleNamespace(group_id=200))
 
-        assert await self._check()
+    def test_required_mode_rejects_missing_gate(self):
+        with (
+            patch.object(group_access, "get_plugin", return_value=None),
+            patch.object(group_access, "get_loaded_plugins", return_value=set()),
+        ):
+            error_message = None
+            try:
+                group_access.configure_group_gate("required")
+            except RuntimeError as error:
+                error_message = str(error)
+            assert error_message is not None
+            assert "requires the group_superuser_gate" in error_message
 
-    async def test_rejects_group_without_configured_superuser_member(self):
-        self.bot.get_group_member_list.return_value = [{"user_id": 9}]
+    def test_incompatible_loaded_gate_is_rejected(self):
+        with patch.object(group_access, "get_plugin", return_value=gate_plugin(AsyncMock(), version=2)):
+            error_message = None
+            try:
+                group_access.configure_group_gate("auto")
+            except RuntimeError as error:
+                error_message = str(error)
+            assert error_message is not None
+            assert "incompatible interface" in error_message
 
-        assert not await self._check()
+    async def test_private_events_remain_rejected_by_group_rule(self):
+        gate = AsyncMock(return_value=True)
+        with patch.object(group_access, "get_plugin", return_value=gate_plugin(gate)):
+            group_access.configure_group_gate("required")
 
-    async def test_rejects_silently_when_member_query_fails(self):
-        self.bot.get_group_member_list.side_effect = RuntimeError("unsupported")
-
-        assert not await self._check()
-
-    async def test_rejects_without_configured_superusers_without_query(self):
-        assert not await self._check(superusers=set())
-        self.bot.get_group_member_list.assert_not_awaited()
-
-    async def test_reuses_result_for_same_message_event(self):
-        self.bot.get_group_member_list.return_value = [{"user_id": 10}]
-        event = FakeGroupMessageEvent()
-
-        assert await self._check(event)
-        assert await self._check(event)
-        self.bot.get_group_member_list.assert_awaited_once_with(group_id=200)
+        assert not await group_access.group_has_superuser(object(), SimpleNamespace())
+        gate.assert_not_awaited()

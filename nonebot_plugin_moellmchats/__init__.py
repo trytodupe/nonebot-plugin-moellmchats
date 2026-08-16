@@ -1,7 +1,7 @@
 from typing import Optional
 
 import aiohttp
-from nonebot import on_command
+from nonebot import get_driver, on_command
 from nonebot.adapters.onebot.v11 import GROUP, Bot, GroupMessageEvent, Message, MessageEvent, PrivateMessageEvent
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, require
@@ -12,7 +12,8 @@ require("nonebot_plugin_localstore")
 
 from . import moe_llm as llm
 from .access_control import evaluate_private_access, is_private_acl_exempt_user
-from .group_access import group_has_superuser
+from .Config import config_parser
+from .group_access import configure_group_gate, group_has_superuser
 from .ImageCache import image_cache
 from .request_registry import PendingRequest, RequestSnapshot, request_registry
 from .trigger_rules import contains_doubao_help_trigger, should_trigger_group_chat
@@ -26,6 +27,11 @@ __plugin_meta__ = PluginMetadata(
     homepage="https://github.com/Elflare/nonebot-plugin-moellmchats",
     supported_adapters={"~onebot.v11"},
 )
+
+
+@get_driver().on_startup
+def _configure_group_gate():
+    configure_group_gate(config_parser.get_config("group_gate_mode") or "auto")
 
 
 def _session_key(event: MessageEvent) -> str:

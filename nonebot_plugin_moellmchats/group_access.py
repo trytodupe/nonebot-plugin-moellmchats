@@ -1,56 +1,65 @@
-from collections import OrderedDict
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, Callable, Optional
 
-from nonebot import get_driver
-from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.log import logger
+from nonebot.plugin import get_loaded_plugins, get_plugin
 
-_EVENT_CACHE_LIMIT = 1024
-_event_access_cache: OrderedDict[tuple[str, int, int], bool] = OrderedDict()
-
-
-def _configured_superusers() -> set[str]:
-    configured = getattr(get_driver().config, "superusers", set()) or set()
-    return {str(user_id).strip() for user_id in configured if str(user_id).strip()}
+_PLUGIN_NAME = "group_superuser_gate"
+_EXPECTED_INTERFACE_VERSION = 1
+_group_gate: Optional[Callable[[Any, Any], Awaitable[bool]]] = None
 
 
-def _event_cache_key(bot: Bot, event: Any) -> tuple[str, int, int] | None:
-    message_id = getattr(event, "message_id", None)
-    if message_id is None:
-        return None
-    return str(bot.self_id), int(event.group_id), int(message_id)
+def _find_gate_plugin():
+    plugin = get_plugin(_PLUGIN_NAME)
+    if plugin is not None:
+        return plugin
+    return next(
+        (
+            candidate
+            for candidate in get_loaded_plugins()
+            if candidate.name == _PLUGIN_NAME or candidate.module_name.rsplit(".", 1)[-1] == _PLUGIN_NAME
+        ),
+        None,
+    )
 
 
-def _cache_result(key: tuple[str, int, int] | None, allowed: bool) -> None:
-    if key is None:
+def configure_group_gate(mode="auto"):
+    global _group_gate
+
+    configured_mode = str(mode or "auto").strip().lower()
+    if configured_mode not in {"auto", "required", "off"}:
+        raise RuntimeError(f"Invalid moellmchats group_gate_mode: {configured_mode!r}")
+
+    _group_gate = None
+    if configured_mode == "off":
+        logger.info("Moellmchats group gate is disabled")
         return
-    _event_access_cache[key] = allowed
-    _event_access_cache.move_to_end(key)
-    while len(_event_access_cache) > _EVENT_CACHE_LIMIT:
-        _event_access_cache.popitem(last=False)
+
+    plugin = _find_gate_plugin()
+    if plugin is None:
+        if configured_mode == "required":
+            raise RuntimeError("Moellmchats requires the group_superuser_gate plugin, but it is not loaded")
+        logger.info("Moellmchats group gate is unavailable; continuing in auto mode")
+        return
+
+    interface_version = getattr(plugin.module, "GROUP_SUPERUSER_GATE_INTERFACE_VERSION", None)
+    gate = getattr(plugin.module, "group_has_superuser", None)
+    if interface_version != _EXPECTED_INTERFACE_VERSION or not callable(gate):
+        raise RuntimeError(
+            "Loaded group_superuser_gate has an incompatible interface "
+            f"(expected {_EXPECTED_INTERFACE_VERSION}, got {interface_version!r})"
+        )
+
+    _group_gate = gate
+    logger.success(f"Moellmchats group gate active: provider={plugin.module_name}, interface={interface_version}")
 
 
-async def group_has_superuser(bot: Bot, event: MessageEvent) -> bool:
+async def group_has_superuser(bot, event):
     if not hasattr(event, "group_id"):
         return False
+    if _group_gate is None:
+        return True
+    return bool(await _group_gate(bot, event))
 
-    cache_key = _event_cache_key(bot, event)
-    if cache_key in _event_access_cache:
-        return _event_access_cache[cache_key]
 
-    superusers = _configured_superusers()
-    if not superusers:
-        _cache_result(cache_key, False)
-        return False
-
-    try:
-        members = await bot.get_group_member_list(group_id=event.group_id)
-    except Exception:
-        logger.warning(f"Failed to check superuser membership for group {event.group_id}")
-        _cache_result(cache_key, False)
-        return False
-
-    member_ids = {str(member.get("user_id")).strip() for member in members if member.get("user_id") is not None}
-    allowed = bool(superusers & member_ids)
-    _cache_result(cache_key, allowed)
-    return allowed
+__all__ = ["configure_group_gate", "group_has_superuser"]
