@@ -2,7 +2,6 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import unittest
 
-
 module_path = Path(__file__).resolve().parents[1] / "nonebot_plugin_moellmchats" / "trigger_rules.py"
 spec = spec_from_file_location("nonebot_plugin_moellmchats.trigger_rules", module_path)
 trigger_rules = module_from_spec(spec)

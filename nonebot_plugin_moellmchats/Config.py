@@ -1,7 +1,7 @@
-import ujson as json
 from pathlib import Path
 
 import nonebot_plugin_localstore as store
+import ujson as json
 
 config_path: Path = store.get_plugin_config_dir()
 
@@ -14,7 +14,7 @@ class ConfigParser:
     def parse_config(self):
         """Parse the JSON configuration file and return the configuration dictionary."""
         try:
-            with open(self.filepath, "r", encoding="utf-8") as file:
+            with open(self.filepath, encoding="utf-8") as file:
                 config = json.load(file)
             return config
         except FileNotFoundError:
