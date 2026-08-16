@@ -13,7 +13,7 @@ require("nonebot_plugin_localstore")
 from . import moe_llm as llm
 from .access_control import evaluate_private_access, is_private_acl_exempt_user
 from .Config import config_parser
-from .group_access import configure_group_gate, group_has_superuser
+from .group_access import configure_group_gate, event_access_allowed, group_has_superuser
 from .ImageCache import image_cache
 from .request_registry import PendingRequest, RequestSnapshot, request_registry
 from .trigger_rules import contains_doubao_help_trigger, should_trigger_group_chat
@@ -298,8 +298,12 @@ async def group_chat_trigger(bot: Bot, event: MessageEvent) -> bool:
     return should_trigger and await group_has_superuser(bot, event)
 
 
-def private_message_only(event: MessageEvent) -> bool:
-    return isinstance(event, PrivateMessageEvent) and not is_private_acl_exempt_user(event.user_id)
+async def private_message_only(bot: Bot, event: MessageEvent) -> bool:
+    return (
+        isinstance(event, PrivateMessageEvent)
+        and await event_access_allowed(bot, event)
+        and not is_private_acl_exempt_user(event.user_id)
+    )
 
 
 llm_matcher = on_message(

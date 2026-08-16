@@ -5,7 +5,7 @@ from nonebot.log import logger
 from nonebot.plugin import get_loaded_plugins, get_plugin
 
 _PLUGIN_NAME = "group_superuser_gate"
-_EXPECTED_INTERFACE_VERSION = 1
+_EXPECTED_INTERFACE_VERSION = 2
 _group_gate: Optional[Callable[[Any, Any], Awaitable[bool]]] = None
 
 
@@ -43,7 +43,7 @@ def configure_group_gate(mode="auto"):
         return
 
     interface_version = getattr(plugin.module, "GROUP_SUPERUSER_GATE_INTERFACE_VERSION", None)
-    gate = getattr(plugin.module, "group_has_superuser", None)
+    gate = getattr(plugin.module, "event_access_allowed", None)
     if interface_version != _EXPECTED_INTERFACE_VERSION or not callable(gate):
         raise RuntimeError(
             "Loaded group_superuser_gate has an incompatible interface "
@@ -57,9 +57,13 @@ def configure_group_gate(mode="auto"):
 async def group_has_superuser(bot, event):
     if not hasattr(event, "group_id"):
         return False
+    return await event_access_allowed(bot, event)
+
+
+async def event_access_allowed(bot, event):
     if _group_gate is None:
         return True
     return bool(await _group_gate(bot, event))
 
 
-__all__ = ["configure_group_gate", "group_has_superuser"]
+__all__ = ["configure_group_gate", "event_access_allowed", "group_has_superuser"]

@@ -24,13 +24,13 @@ assert spec.loader is not None
 spec.loader.exec_module(group_access)
 
 
-def gate_plugin(gate, version=1):
+def gate_plugin(gate, version=2):
     return SimpleNamespace(
         name="group_superuser_gate",
         module_name="group_superuser_gate",
         module=SimpleNamespace(
             GROUP_SUPERUSER_GATE_INTERFACE_VERSION=version,
-            group_has_superuser=gate,
+            event_access_allowed=gate,
         ),
     )
 
@@ -72,7 +72,7 @@ class GroupAccessTest(unittest.IsolatedAsyncioTestCase):
             assert "requires the group_superuser_gate" in error_message
 
     def test_incompatible_loaded_gate_is_rejected(self):
-        with patch.object(group_access, "get_plugin", return_value=gate_plugin(AsyncMock(), version=2)):
+        with patch.object(group_access, "get_plugin", return_value=gate_plugin(AsyncMock(), version=1)):
             error_message = None
             try:
                 group_access.configure_group_gate("auto")
@@ -88,3 +88,13 @@ class GroupAccessTest(unittest.IsolatedAsyncioTestCase):
 
         assert not await group_access.group_has_superuser(object(), SimpleNamespace())
         gate.assert_not_awaited()
+
+    async def test_private_events_use_event_gate(self):
+        gate = AsyncMock(return_value=False)
+        with patch.object(group_access, "get_plugin", return_value=gate_plugin(gate)):
+            group_access.configure_group_gate("required")
+
+        bot = object()
+        event = SimpleNamespace()
+        assert not await group_access.event_access_allowed(bot, event)
+        gate.assert_awaited_once_with(bot, event)

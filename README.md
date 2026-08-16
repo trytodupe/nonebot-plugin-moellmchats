@@ -129,7 +129,7 @@ LOCALSTORE_USE_CWD=True # 可选
 COMMAND_START=["/",""]  # 可选
 ```
 
-`group_gate_mode` 控制可选的 `group_superuser_gate` 插件：`auto` 在 gate 已加载时使用、缺失时保持原行为；`required` 在 gate 缺失或 interface 不兼容时拒绝启动；`off` 明确禁用。gate 启用后，群聊 matcher 仅在至少一个 `SUPERUSERS` 账号是该群成员时运行；私聊访问控制不受影响。
+`group_gate_mode` 控制可选的 `group_superuser_gate` 插件：`auto` 在 gate 已加载时使用、缺失时保持原行为；`required` 在 gate 缺失或 interface 不兼容时拒绝启动；`off` 明确禁用。gate 启用后，群聊 matcher 仅在至少一个 `SUPERUSERS` 账号是该群成员时运行，私聊 matcher 服从 gate 的全局私聊开关。
 
 ### 本插件主要配置
 
