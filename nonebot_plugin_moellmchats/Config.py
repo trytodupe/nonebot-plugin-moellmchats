@@ -20,6 +20,7 @@ class ConfigParser:
         except FileNotFoundError:
             # Create a new configuration file with default values
             config = {
+                "allowed_group_ids": [],
                 "max_group_history": 10,
                 "max_user_history": 8,
                 "max_retry_times": 3,

@@ -11,11 +11,12 @@ from nonebot.rule import Rule, to_me
 require("nonebot_plugin_localstore")
 
 from . import moe_llm as llm
+from .Config import config_parser
 from .access_control import evaluate_private_access, is_private_acl_exempt_user
 from .group_access import group_has_superuser
 from .ImageCache import image_cache
 from .request_registry import PendingRequest, RequestSnapshot, request_registry
-from .trigger_rules import contains_doubao_help_trigger, should_trigger_group_chat
+from .trigger_rules import contains_doubao_help_trigger, is_allowed_group, should_trigger_group_chat
 from .utils import format_message
 
 __plugin_meta__ = PluginMetadata(
@@ -32,6 +33,13 @@ def _session_key(event: MessageEvent) -> str:
     if isinstance(event, GroupMessageEvent):
         return f"group:{event.group_id}"
     return f"private:{event.user_id}"
+
+
+def plugin_group_allowed(event: MessageEvent) -> bool:
+    return isinstance(event, GroupMessageEvent) and is_allowed_group(
+        event.group_id,
+        config_parser.get_config("allowed_group_ids") or [],
+    )
 
 
 def _user_name(event: MessageEvent) -> str:
@@ -100,7 +108,7 @@ def _pending_exists_text(active: RequestSnapshot) -> str:
 
 
 message_matcher = on_message(
-    rule=Rule(group_has_superuser),
+    rule=Rule(plugin_group_allowed, group_has_superuser),
     permission=GROUP,
     priority=1,
     block=False,
@@ -199,7 +207,7 @@ async def handle_llm(
 
 llm_status_matcher = on_command(
     "llm",
-    rule=to_me(),
+    rule=Rule(plugin_group_allowed) & to_me(),
     priority=5,
     block=True,
 )
@@ -238,7 +246,7 @@ async def valid_confirmation(event: MessageEvent) -> bool:
 
 
 confirmation_matcher = on_message(
-    rule=Rule(valid_confirmation),
+    rule=Rule(plugin_group_allowed, valid_confirmation),
     priority=4,
     block=True,
 )
@@ -283,7 +291,7 @@ def _contains_doubao_help_trigger(message) -> bool:
 
 
 async def group_chat_trigger(bot: Bot, event: MessageEvent) -> bool:
-    if not isinstance(event, GroupMessageEvent):
+    if not plugin_group_allowed(event):
         return False
     should_trigger = should_trigger_group_chat(
         await at_me_only(bot, event),
@@ -318,7 +326,7 @@ async def _(bot: Bot, event: MessageEvent):
 
 
 private_llm_matcher = on_message(
-    rule=Rule(private_message_only),
+    rule=Rule(plugin_group_allowed, private_message_only),
     priority=99,
     block=True,
 )
