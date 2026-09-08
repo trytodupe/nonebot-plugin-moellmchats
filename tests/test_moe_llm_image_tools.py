@@ -717,6 +717,152 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         self.assertNotIn("fetch_recent_images", [tool.get("name") for tool in second_tools])
         llm._send_text_response.assert_awaited_once_with("final answer")
 
+    def test_responses_api_surfaces_failed_terminal_event(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "url": "https://example.com/v1/responses",
+            "key": "Bearer test-key",
+            "model": "test-model",
+            "stream": True,
+        }
+        llm.prompt = "test prompt"
+        llm.messages_handler.current_images = []
+
+        failed_response = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "code": "server_error",
+                    "message": "upstream overloaded",
+                },
+                "output": [],
+            }
+        )
+
+        class FakeStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if hasattr(self, "sent"):
+                    raise StopAsyncIteration
+                self.sent = True
+                return SimpleNamespace(type="response.failed", response=failed_response)
+
+        responses = SimpleNamespace(create=AsyncMock(return_value=FakeStream()))
+        client = SimpleNamespace(responses=responses, close=AsyncMock())
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        llm._build_responses_input = AsyncMock(return_value=[])
+
+        with (
+            patch.object(moe_llm.aiohttp, "ClientSession", return_value=FakeSession(), create=True),
+            patch.object(moe_llm.aiohttp, "ClientTimeout", return_value=object(), create=True),
+            patch.object(moe_llm, "AsyncOpenAI", return_value=client),
+            patch.object(moe_llm.logger, "info", MagicMock()),
+            patch.object(moe_llm.logger, "warning", MagicMock()),
+        ):
+            result = asyncio.run(
+                llm.responses_llm_chat(
+                    llm.model_info["url"],
+                    {},
+                    [],
+                    None,
+                )
+            )
+
+        self.assertEqual(result, "模型请求失败：server_error: upstream overloaded")
+        responses.create.assert_awaited_once()
+
+    def test_responses_api_retries_once_after_empty_completed_response(self):
+        llm = self.build_llm()
+        llm.model_info = {
+            "url": "https://example.com/v1/responses",
+            "key": "Bearer test-key",
+            "model": "test-model",
+            "stream": True,
+        }
+        llm.prompt = "test prompt"
+        llm.messages_handler.current_images = []
+        llm.messages_handler.post_process = MagicMock()
+
+        def response_with_text(text):
+            response = SimpleNamespace(
+                model_dump=lambda **_kwargs: {
+                    "id": "resp_test",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    ],
+                },
+                output_text=text,
+            )
+
+            class FakeStream:
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if hasattr(self, "sent"):
+                        raise StopAsyncIteration
+                    self.sent = True
+                    return SimpleNamespace(type="response.completed", response=response)
+
+            return FakeStream()
+
+        responses = SimpleNamespace(
+            create=AsyncMock(
+                side_effect=[
+                    response_with_text('{"assistant_reply":"","image_memories":[]}'),
+                    response_with_text('{"assistant_reply":"retry worked","image_memories":[]}'),
+                ]
+            )
+        )
+        client = SimpleNamespace(responses=responses, close=AsyncMock())
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        llm._build_responses_input = AsyncMock(return_value=[])
+        llm._send_text_response = AsyncMock()
+        llm._apply_image_memory_updates = MagicMock()
+        llm._sync_group_context_with_current_user_message = MagicMock()
+
+        with (
+            patch.object(moe_llm.aiohttp, "ClientSession", return_value=FakeSession(), create=True),
+            patch.object(moe_llm.aiohttp, "ClientTimeout", return_value=object(), create=True),
+            patch.object(moe_llm, "AsyncOpenAI", return_value=client),
+            patch.object(moe_llm.logger, "info", MagicMock()),
+            patch.object(moe_llm.logger, "warning", MagicMock()),
+        ):
+            result = asyncio.run(
+                llm.responses_llm_chat(
+                    llm.model_info["url"],
+                    {},
+                    [],
+                    None,
+                )
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(responses.create.await_count, 2)
+        llm._send_text_response.assert_awaited_once_with("retry worked")
+
     def test_extracts_chat_tool_calls(self):
         llm = self.build_llm()
         response = {

@@ -127,6 +127,7 @@ class MoeLlm:
         self.prompt = BASE_PROMPT
         self.fetched_images = []
         self.fetch_recent_images_rounds = 0
+        self.empty_response_retries = 0
         self.pending_user_avatar_requests = []
         self.image_inputs_by_id = {}
         self.imagegen_instructions_provided = False
@@ -179,6 +180,32 @@ class MoeLlm:
         if not message:
             return type(exc).__name__
         return message
+
+    def _response_body(self, response) -> dict:
+        if isinstance(response, dict):
+            return response
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            return model_dump(mode="json", warnings=False)
+        return {}
+
+    def _format_response_terminal_status(self, body: dict) -> str:
+        status = body.get("status")
+        error = body.get("error") or {}
+        if status == "failed":
+            code = str(error.get("code") or "").strip()
+            message = str(error.get("message") or "").strip()
+            detail = ": ".join(part for part in (code, message) if part)
+            return f"模型请求失败：{detail}" if detail else "模型请求失败，请稍后重试。"
+
+        if status == "incomplete":
+            details = body.get("incomplete_details") or {}
+            reason = str(details.get("reason") or "").strip()
+            if reason:
+                return f"模型响应未完成：{reason}。"
+            return "模型响应未完成，请稍后重试。"
+
+        return "模型响应流未完成，请稍后重试。"
 
     def _is_redundant_image_completion_reply(self, text: str) -> bool:
         normalized = str(text).strip().strip("。.!！~～ ")
@@ -1874,6 +1901,7 @@ class MoeLlm:
         stream_event_counts = defaultdict(int)
         streamed_function_calls = []
         final_response = None
+        terminal_response = None
         stream_started_at = time.monotonic()
 
         def log_generation_candidate_event(event, event_type: str):
@@ -1962,6 +1990,8 @@ class MoeLlm:
                             await self.send_generation_notice_event_once()
                         if event_type == "response.completed":
                             final_response = getattr(event, "response", None)
+                        elif event_type in {"response.failed", "response.incomplete"}:
+                            terminal_response = getattr(event, "response", None)
                 if final_response is None:
                     logger.warning(
                         {
@@ -1984,11 +2014,9 @@ class MoeLlm:
             if http_client is not None:
                 await http_client.aclose()
 
-        body = (
-            final_response.model_dump(mode="json", warnings=False)
-            if final_response is not None
-            else {"id": None, "status": "stream_incomplete", "output": streamed_function_calls}
-        )
+        body = self._response_body(final_response if final_response is not None else terminal_response)
+        if not body:
+            body = {"id": None, "status": "stream_incomplete", "output": streamed_function_calls}
         body = self._merge_streamed_function_calls(body, streamed_function_calls)
         self._log_responses_summary(
             body,
@@ -1996,6 +2024,10 @@ class MoeLlm:
             dict(stream_event_counts),
             sum(len(chunk) for chunk in streamed_text_chunks),
         )
+        if body.get("status") in {"failed", "incomplete"}:
+            return self._format_response_terminal_status(body)
+        if final_response is None:
+            return self._format_response_terminal_status(body)
         rerun_with_imagegen_instructions = (
             not self.imagegen_instructions_provided
             and self._extract_function_args(body, "get_imagegen_instructions")
@@ -2132,9 +2164,27 @@ class MoeLlm:
         )
 
         if not assistant_reply and not image_calls and sent_stream_image_count == 0 and external_sent_images == 0:
+            if body.get("status") == "completed" and self.empty_response_retries < 1:
+                self.empty_response_retries += 1
+                logger.warning(
+                    {
+                        "event": "responses_empty_output_retry",
+                        "response_id": body.get("id"),
+                        "streamed_text_chars": len(streamed_reply),
+                    }
+                )
+                return await self.responses_llm_chat(
+                    url,
+                    headers,
+                    send_message_list,
+                    proxy,
+                    native_web_search=native_web_search,
+                    external_image_generation=external_image_generation,
+                    local_image_cache=local_image_cache,
+                )
             if self.fetched_images and self._looks_like_recent_image_request():
                 return f"这轮模型没返回文本或图片；我这边只取到了 {len(self.fetched_images)} 张群缓存图。"
-            return "这轮模型没有返回内容。"
+            return "模型返回了空结果，请再试一次。"
 
         self._apply_image_memory_updates(image_memories)
         self._sync_group_context_with_current_user_message()
