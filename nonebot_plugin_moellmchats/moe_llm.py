@@ -1068,7 +1068,7 @@ class MoeLlm:
         url = self._image_generation_url()
         model = config.get("model") or "gpt-image-2"
         api_key_env = config.get("api_key_env") or "CODEX_API_KEY"
-        api_key = os.getenv(api_key_env)
+        api_key = _configured_environment_value(api_key_env)
         if not api_key:
             return f"图片生成 API key 未配置：{api_key_env}。"
         headers = self._image_api_headers(api_key)
@@ -1114,7 +1114,7 @@ class MoeLlm:
         url = self._image_edit_url()
         model = config.get("model") or "gpt-image-2"
         api_key_env = config.get("api_key_env") or "CODEX_API_KEY"
-        api_key = os.getenv(api_key_env)
+        api_key = _configured_environment_value(api_key_env)
         if not api_key:
             return f"图片编辑 API key 未配置：{api_key_env}。"
         headers = self._image_api_headers(api_key, multipart=True)
