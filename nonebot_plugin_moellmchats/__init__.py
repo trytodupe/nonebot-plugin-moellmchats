@@ -1,6 +1,5 @@
 from typing import Optional
 
-import aiohttp
 from nonebot import get_driver, on_command
 from nonebot.adapters.onebot.v11 import GROUP, Bot, GroupMessageEvent, Message, MessageEvent, PrivateMessageEvent
 from nonebot.params import CommandArg
@@ -113,17 +112,23 @@ message_matcher = on_message(
 )
 
 
-async def cache_message_images(event: GroupMessageEvent, message_dict: dict):
-    images = message_dict.get("images") or []
-    if not images:
-        return []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-        return await image_cache.cache_images(
-            session,
-            group_id=event.group_id,
-            user_id=event.user_id,
-            images=images,
-        )
+@get_driver().on_startup
+async def _start_image_cache():
+    await image_cache.start()
+
+
+@get_driver().on_shutdown
+async def _stop_image_cache():
+    await image_cache.close()
+
+
+def cache_message_images(event: GroupMessageEvent, message_dict: dict):
+    return image_cache.observe(
+        group_id=event.group_id,
+        user_id=event.user_id,
+        message_id=event.message_id,
+        images=message_dict.get("images") or [],
+    )
 
 
 @message_matcher.handle()
@@ -132,9 +137,7 @@ async def context_dict_func(bot: Bot, event: MessageEvent):
         return
     if message_dict := await format_message(event, bot):
         if message_dict["text"] or message_dict["images"]:
-            cached_images = await cache_message_images(event, message_dict)
-            if cached_images:
-                message_dict["images"] = cached_images
+            cache_message_images(event, message_dict)
             sender_name = event.sender.card or event.sender.nickname
             llm.context_dict[_session_key(event)].append(
                 {
@@ -321,9 +324,6 @@ async def _(bot: Bot, event: MessageEvent):
     format_message_dict = await format_message(event, bot)
     if not format_message_dict["text"] and not format_message_dict["images"]:
         return
-    cached_images = await cache_message_images(event, format_message_dict)
-    if cached_images:
-        format_message_dict["images"] = cached_images
     await handle_llm(bot, event, format_message_dict)
 
 

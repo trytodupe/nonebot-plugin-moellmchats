@@ -937,6 +937,61 @@ class MoeLlmImageToolsTest(unittest.TestCase):
         asyncio.run(llm._prepare_current_images(session=object()))
         self.assertTrue(llm._prepare_images.call_args.kwargs["include_known_images"])
 
+    def test_model_images_use_shared_bounded_cache(self):
+        llm = self.build_llm()
+        llm.model_info = {}
+        image = {"source_url": "https://example.com/a.png"}
+        read = AsyncMock(return_value=(b"\x89PNG\r\n\x1a\nimage", "image/png"))
+        with (
+            patch.object(moe_llm.image_cache, "read_image", read),
+            patch.object(moe_llm.image_memory_store, "get_summary", return_value=None),
+        ):
+            prepared = asyncio.run(llm._prepare_images(object(), [image]))
+        self.assertEqual(len(prepared), 1)
+        self.assertTrue(prepared[0]["data_url"].startswith("data:image/png;base64,"))
+        read.assert_awaited_once_with(image, group_id=2, user_id=1, message_id=42, proxy=None)
+
+    def test_unavailable_images_preserve_text_model_input(self):
+        llm = self.build_llm()
+        llm.model_info = {"is_vision": True}
+        llm.messages_handler.current_images = [{"source_url": "https://example.com/a.png"}]
+        llm._build_user_ref_content = lambda: []
+        with patch.object(moe_llm.image_cache, "read_image", AsyncMock(return_value=None)):
+            inputs = asyncio.run(llm._build_responses_input(object(), [{"role": "user", "content": "请看这张图[图片]"}]))
+        self.assertEqual(inputs[-1]["content"], [{"type": "input_text", "text": "请看这张图[图片暂不可用]"}])
+
+    def test_partial_image_failure_preserves_attachment_order(self):
+        llm = self.build_llm()
+        llm.model_info = {"is_vision": True}
+        llm.messages_handler.current_images = [
+            {"source_url": "https://example.com/missing.png"},
+            {"source_url": "https://example.com/available.png"},
+        ]
+        llm._build_user_ref_content = lambda: []
+        read = AsyncMock(side_effect=[None, (b"\x89PNG\r\n\x1a\nimage", "image/png")])
+        with (
+            patch.object(moe_llm.image_cache, "read_image", read),
+            patch.object(moe_llm.image_memory_store, "get_summary", return_value=None),
+        ):
+            inputs = asyncio.run(llm._build_responses_input(object(), [{"role": "user", "content": "A[图片]B[图片]"}]))
+        content = inputs[-1]["content"]
+        self.assertTrue(content[0]["text"].startswith("A[图片暂不可用]B[image:"))
+        self.assertEqual(sum(item["type"] == "input_image" for item in content), 1)
+
+    def test_recent_image_tool_awaits_cache_lookup(self):
+        llm = self.build_llm()
+        recent = [{"image_id": "img_one", "source_url": "https://example.com/a.png"}]
+        read = AsyncMock(return_value=recent)
+        with patch.object(moe_llm.image_cache, "get_recent_group_images", read):
+            rerun, count = asyncio.run(llm._handle_chat_tool_calls(
+                [{"id": "call_1", "type": "function", "name": "fetch_recent_images", "arguments": '{"limit":2}'}],
+                external_image_generation=False, local_image_cache=True,
+            ))
+        self.assertTrue(rerun)
+        self.assertEqual(count, 0)
+        self.assertEqual(llm.fetched_images, recent)
+        read.assert_awaited_once_with(group_id=2, limit=2, offset=0)
+
     def test_extracts_image_edit_args(self):
         llm = self.build_llm()
         response = {

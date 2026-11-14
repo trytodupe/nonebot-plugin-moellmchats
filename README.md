@@ -252,7 +252,25 @@ your_absolute_path/
 - `reasoning_effort`: 可选，透传给 Responses API 的 `reasoning.effort`。
 - `verbosity`: 可选，仅在 `api_style = "responses"` 时生效，透传给 Responses API 的 `text.verbosity`。群聊回复若嫌太像标准答案，建议设为 `low`。
 
-> 使用 `responses` + `is_vision = true` 时，插件会在**首次遇到某张图片**时下载并转成 base64 发送；后续相同图片会只保留成历史文本 `[image:summary]`，避免重复上传图片内容。
+> 使用 `responses` + `is_vision = true` 时，插件把本轮需要的图片转成 base64 发送；已有摘要的图片通常只保留历史文本 `[image:summary]`，避免重复上传图片内容。
+
+群图片记忆使用有界后台预取，普通消息收集不等待图片下载。只有通过群访问门禁的消息才会预取；显式识图、引用图片、最近图片工具和头像使用同一个受限下载器。图片失败会保留文字，并在本轮提示模型图片暂不可用。相同 URL 的并发请求合并，不同 URL 的相同内容在下载后按哈希合并；一个群的过期清理不会删除另一个群仍在引用的图片。
+
+`config.json` 可设置以下参数；旧配置缺少这些键时也使用对应默认值：
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `image_cache_prefetch` | `true` | 是否预取普通群图片；关闭后显式图片请求仍可下载 |
+| `image_cache_workers` | `4` | 全局下载并发；同一个群最多一个任务运行 |
+| `image_cache_queue_size` | `64` | 下载任务容量；满时显式请求优先于排队的预取 |
+| `image_cache_per_group_pending` | `8` | 每群预取引用配额，重复发送者的相同 URL 合并 |
+| `image_cache_max_image_bytes` | `10485760` | 单图 10 MiB，流式读取时强制检查 |
+| `image_cache_max_bytes` | `268435456` | 图片文件总量 256 MiB，超出后淘汰最旧图片 |
+| `image_cache_download_timeout` | `15` | 下载总超时秒数；失败 URL 暂停重试 30 秒 |
+| `image_cache_expire_seconds` | `3600` | 每个引用的有效期；每分钟后台清理 |
+| `image_cache_max_records_per_user` | `20` | 每用户及每群保留的最近不同图片数 |
+
+队列满时预取会跳过，历史图片可用性为尽力而为。数据保存在插件目录下 `image_cache_v2/` 的 SQLite 索引和图片文件中，所有文件/数据库操作移出事件循环；URL 映射及引用各最多 4096 条。旧 `image_cache_index.json` 和 `image_cache/` 不自动导入或删除；升级时应在停服务后备份它们，新缓存从空开始。
 
 `vertex_image_generation` 使用 Vertex AI `generateContent` REST 接口，支持 `gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image` 和 `gemini-2.5-flash-image`。API key 应写入 NoneBot 项目的 `.env`（例如 `VERTEX_AI_API_KEY=...`），JSON 中只保存 `credential_env` 名称；仍可用 `credential_file` 作为 fallback。只有白名单群会向 LLM 暴露 `generate_image_with_gemini`；执行时会再次检查群号。普通图片请求仍默认使用 OpenAI，用户明确要求 Google、Gemini 或具体 Gemini 图片模型时才调用 Vertex。图片生成结果以一条 QQ 消息发送：图片、模型名和实际像素 scale。
 

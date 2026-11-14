@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import hashlib
 import os
@@ -34,7 +33,6 @@ from .image_generation import (
 )
 from .response_utils import (
     build_image_reference,
-    detect_image_media_type,
     extract_image_generation_calls,
     extract_response_output_text,
     is_long_message,
@@ -1324,7 +1322,7 @@ class MoeLlm:
                 limit = parsed_arguments.get("limit") or default_limit
                 offset = parsed_arguments.get("offset") or 0
                 self.fetch_recent_images_rounds += 1
-                fetched_images = image_cache.get_recent_group_images(
+                fetched_images = await image_cache.get_recent_group_images(
                     group_id=self.event.group_id,
                     limit=max(1, min(int(limit), max_limit)),
                     offset=max(0, int(offset)),
@@ -1531,33 +1529,20 @@ class MoeLlm:
         images: list[dict],
         *,
         include_known_images: bool = False,
+        remember_in_group: bool = True,
     ) -> list[dict]:
         prepared = []
         proxy = self.model_info.get("proxy")
-        for image in images:
-            image_bytes = None
-            mime_type = image.get("mime_type")
-            filename = "image.png"
-            if file_path := image.get("file_path"):
-                path = Path(file_path)
-                if path.exists():
-                    image_bytes = path.read_bytes()
-                    mime_type = detect_image_media_type(image_bytes, mime_type)
-                    filename = path.name
-            if image_bytes is None:
-                source_url = image.get("source_url")
-                if not source_url:
-                    continue
-                async with session.get(source_url, proxy=proxy, ssl=False) as response:
-                    if response.status != 200:
-                        raise RuntimeError(f"图片下载失败: {response.status}")
-                    image_bytes = await response.read()
-                    mime_type = detect_image_media_type(
-                        image_bytes, response.content_type
-                    )
-                    filename = Path(str(source_url).split("?", 1)[0]).name or filename
-            if not mime_type:
-                raise RuntimeError("图片格式无法识别或当前不受支持")
+        group = getattr(self.event, "group_id", f"private:{self.user_id}") if remember_in_group else f"avatar:{self.user_id}"
+        for source_index, image in enumerate(images):
+            downloaded = await image_cache.read_image(
+                image, group_id=group, user_id=self.user_id,
+                message_id=getattr(self.event, "message_id", 0), proxy=proxy,
+            )
+            if downloaded is None:
+                continue
+            image_bytes, mime_type = downloaded
+            filename = Path(image.get("file_path") or str(image.get("source_url", "image.png")).split("?", 1)[0]).name
             digest = hashlib.sha256(image_bytes).hexdigest()
             image_id = f"img_sha256_{digest[:16]}"
             summary = image_memory_store.get_summary(image_id)
@@ -1575,6 +1560,7 @@ class MoeLlm:
                         "image_id": image_id,
                         "summary": summary,
                         "known": True,
+                        "source_index": source_index,
                     }
                 )
                 continue
@@ -1585,6 +1571,7 @@ class MoeLlm:
                     "mime_type": mime_type,
                     "data_url": data_url,
                     "known": False,
+                    "source_index": source_index,
                 }
             )
         return prepared
@@ -1605,6 +1592,7 @@ class MoeLlm:
             session,
             [{"source_url": source_url}],
             include_known_images=True,
+            remember_in_group=False,
         )
         if not prepared:
             return None
@@ -1705,13 +1693,14 @@ class MoeLlm:
             return input_items
 
         prepared_images = await self._prepare_current_images(session)
-        markers = []
+        markers = ["[图片暂不可用]"] * len(self.messages_handler.current_images)
         new_images = []
         for image in prepared_images:
+            source_index = image["source_index"]
             if image["known"]:
-                markers.append(build_image_reference(image["summary"]))
+                markers[source_index] = build_image_reference(image["summary"])
             else:
-                markers.append(f"[image:{image['image_id']}]")
+                markers[source_index] = f"[image:{image['image_id']}]"
                 new_images.append(image)
 
         current_text = replace_image_placeholders(current_text, markers)
@@ -1782,7 +1771,7 @@ class MoeLlm:
         reference_words = ("刚才", "最近", "上面", "前面", "后面", "前几张", "后几张", "这几张", "那几张")
         return any(word in text for word in image_words) and any(word in text for word in reference_words)
 
-    def _prefetch_recent_images_if_needed(self):
+    async def _prefetch_recent_images_if_needed(self):
         if not self._can_use_group_image_cache():
             return
         if self.messages_handler.current_images or self.fetched_images:
@@ -1791,7 +1780,7 @@ class MoeLlm:
             return
         limit = int(config_parser.get_config("fetch_recent_images_default_limit") or 6)
         max_limit = int(config_parser.get_config("fetch_recent_images_max_limit") or 10)
-        self.fetched_images = image_cache.get_recent_group_images(
+        self.fetched_images = await image_cache.get_recent_group_images(
             group_id=self.event.group_id,
             limit=max(1, min(limit, max_limit)),
             offset=0,
@@ -2073,7 +2062,7 @@ class MoeLlm:
                     return False
                 if self.fetch_recent_images_rounds < max_fetch_rounds:
                     self.fetch_recent_images_rounds += 1
-                    fetched_images = image_cache.get_recent_group_images(
+                    fetched_images = await image_cache.get_recent_group_images(
                         group_id=self.event.group_id,
                         limit=fetch_args["limit"],
                         offset=fetch_args["offset"],
@@ -2211,12 +2200,11 @@ class MoeLlm:
         self.prompt_handler()
         send_message_list = self.messages_handler.get_send_message_list()
 
-        self._prefetch_recent_images_if_needed()
+        await self._prefetch_recent_images_if_needed()
 
         use_native_web_search = (
             model_selector.get_web_search() and self._use_native_web_search()
         )
-        use_native_image_generation = self._use_native_image_generation()
         use_external_image_generation = self._use_external_image_generation()
 
         headers = self._merge_headers({
