@@ -1542,7 +1542,7 @@ class MoeLlm:
             if downloaded is None:
                 continue
             image_bytes, mime_type = downloaded
-            filename = Path(image.get("file_path") or str(image.get("source_url", "image.png")).split("?", 1)[0]).name
+            filename = "image." + mime_type.split("/", 1)[-1]
             digest = hashlib.sha256(image_bytes).hexdigest()
             image_id = f"img_sha256_{digest[:16]}"
             summary = image_memory_store.get_summary(image_id)

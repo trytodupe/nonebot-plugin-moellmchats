@@ -949,6 +949,7 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             prepared = asyncio.run(llm._prepare_images(object(), [image]))
         self.assertEqual(len(prepared), 1)
         self.assertTrue(prepared[0]["data_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(next(iter(llm.image_inputs_by_id.values()))["filename"], "image.png")
         read.assert_awaited_once_with(image, group_id=2, user_id=1, message_id=42, proxy=None)
 
     def test_unavailable_images_preserve_text_model_input(self):
