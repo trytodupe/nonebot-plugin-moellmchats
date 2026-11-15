@@ -40,6 +40,7 @@ from .response_utils import (
     parse_assistant_response_payload,
     replace_image_placeholders,
 )
+from .group_context import collect_group_context
 from .prompt_templates import build_group_chat_prompt
 
 context_dict = defaultdict(
@@ -308,6 +309,8 @@ class MoeLlm:
             enable_safeguards=safeguards_enabled,
             instruction_profile="minimal",
         )
+        if runtime_context := collect_group_context(self.bot, self.event):
+            self.prompt += "\n\n群运行时补充信息：\n" + runtime_context
 
     async def _send_text_response(self, text: str):
         if not is_long_message(text) or not hasattr(self.event, "group_id"):
