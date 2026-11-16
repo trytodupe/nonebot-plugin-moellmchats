@@ -32,6 +32,22 @@ class GroupTriggerTest(unittest.TestCase):
     def test_should_trigger_group_chat_rejects_unrelated_group_text(self):
         self.assertFalse(trigger_rules.should_trigger_group_chat(False, "随便聊聊"))
 
+    def test_contains_big_doubao_trigger_accepts_match_within_first_six_chars(self):
+        self.assertTrue(trigger_rules.contains_big_doubao_trigger("大豆包帮我看看"))
+        self.assertTrue(trigger_rules.contains_big_doubao_trigger("  大豆包 帮我查一下"))
+        self.assertTrue(trigger_rules.contains_big_doubao_trigger("@大豆包 帮我看看"))
+        self.assertTrue(trigger_rules.contains_big_doubao_trigger("哈 大豆包帮我"))
+        self.assertTrue(trigger_rules.contains_big_doubao_trigger("123大豆包"))
+        self.assertTrue(trigger_rules.contains_big_doubao_trigger("大豆包"))
+
+    def test_contains_big_doubao_trigger_rejects_regular_doubao_and_late_matches(self):
+        self.assertFalse(trigger_rules.contains_big_doubao_trigger("豆包帮我看看"))
+        self.assertFalse(trigger_rules.contains_big_doubao_trigger("帮我叫一下大豆包"))
+        self.assertFalse(trigger_rules.contains_big_doubao_trigger("1234大豆包帮我"))
+
+    def test_should_trigger_group_chat_accepts_big_doubao_prefix_without_at(self):
+        self.assertTrue(trigger_rules.should_trigger_group_chat(False, "123大豆包帮我查一下"))
+
 
 if __name__ == "__main__":
     unittest.main()

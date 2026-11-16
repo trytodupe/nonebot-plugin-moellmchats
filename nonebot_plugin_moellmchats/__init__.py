@@ -15,7 +15,11 @@ from .Config import config_parser
 from .group_access import configure_group_gate, event_access_allowed, group_has_superuser
 from .ImageCache import image_cache
 from .request_registry import PendingRequest, RequestSnapshot, request_registry
-from .trigger_rules import contains_doubao_help_trigger, should_trigger_group_chat
+from .trigger_rules import (
+    contains_big_doubao_trigger,
+    contains_doubao_help_trigger,
+    should_trigger_group_chat,
+)
 from .utils import format_message
 
 __plugin_meta__ = PluginMetadata(
@@ -120,6 +124,7 @@ async def _start_image_cache():
 @get_driver().on_shutdown
 async def _stop_image_cache():
     await image_cache.close()
+    await llm.close_shared_acp_client()
 
 
 def cache_message_images(event: GroupMessageEvent, message_dict: dict):
@@ -148,6 +153,26 @@ async def context_dict_func(bot: Bot, event: MessageEvent):
             )
 
 
+def _is_big_doubao_request(
+    event: MessageEvent,
+    format_message_dict: dict | None = None,
+) -> bool:
+    get_message = getattr(event, "get_message", None)
+    plain_text = ""
+    if callable(get_message):
+        try:
+            plain_text = str(get_message().extract_plain_text() or "")
+        except Exception:
+            plain_text = ""
+    if not plain_text and isinstance(format_message_dict, dict):
+        plain_text = "".join(str(part) for part in (format_message_dict.get("text") or []))
+    if contains_big_doubao_trigger(plain_text):
+        return True
+    if contains_doubao_help_trigger(plain_text):
+        return False
+    return False
+
+
 async def handle_llm(
     bot: Bot,
     event: MessageEvent,
@@ -155,6 +180,7 @@ async def handle_llm(
     *,
     allow_concurrent: bool = False,
 ):
+    use_big_doubao = _is_big_doubao_request(event, format_message_dict)
     user_id = str(event.user_id)
     scope = _session_key(event)
     preview = _prompt_preview(format_message_dict)
@@ -166,7 +192,12 @@ async def handle_llm(
         allow_concurrent=allow_concurrent,
     )
     if not begin.started:
-        llm_sender = llm.MoeLlm(bot, event, format_message_dict)
+        llm_sender = llm.MoeLlm(
+            bot,
+            event,
+            format_message_dict,
+            use_big_doubao=use_big_doubao,
+        )
         if begin.pending_exists:
             await llm_sender.send_reply_message(_pending_exists_text(begin.active_request))
             return
@@ -198,6 +229,7 @@ async def handle_llm(
             bot,
             event,
             format_message_dict,
+            use_big_doubao=use_big_doubao,
         )
         result = await llm_chat.get_llm_chat()
         if isinstance(result, str):

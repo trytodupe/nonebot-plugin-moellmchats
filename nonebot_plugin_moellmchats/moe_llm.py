@@ -41,7 +41,14 @@ from .response_utils import (
     replace_image_placeholders,
 )
 from .group_context import collect_group_context
+from .agy_acp import (
+    DEFAULT_AGY_MODEL,
+    close_shared_acp_client,
+    get_shared_acp_client,
+    responses_content_to_acp_blocks,
+)
 from .prompt_templates import build_group_chat_prompt
+from .trigger_rules import contains_big_doubao_trigger
 
 context_dict = defaultdict(
     lambda: deque(maxlen=config_parser.get_config("max_group_history"))
@@ -107,6 +114,21 @@ def _read_vertex_api_key(config: dict) -> str:
         return ""
 
 
+def _extract_event_plain_text(event, format_message_dict: dict | None = None) -> str:
+    get_message = getattr(event, "get_message", None)
+    if callable(get_message):
+        try:
+            msg = get_message()
+            extract = getattr(msg, "extract_plain_text", None)
+            if callable(extract):
+                return str(extract() or "")
+        except Exception:
+            pass
+    if isinstance(format_message_dict, dict):
+        return "".join(str(part) for part in (format_message_dict.get("text") or []))
+    return ""
+
+
 class MoeLlm:
     def __init__(
         self,
@@ -115,6 +137,7 @@ class MoeLlm:
         format_message_dict: dict,
         is_objective: bool = False,
         temperament: str = "default",
+        use_big_doubao: bool = False,
     ):
         self.bot = bot
         self.event = event
@@ -122,6 +145,7 @@ class MoeLlm:
         self.user_id = event.user_id
         self.is_objective = is_objective
         self.temperament = temperament
+        self.use_big_doubao = use_big_doubao
         self.model_info = {}
         self.prompt = BASE_PROMPT
         self.fetched_images = []
@@ -246,6 +270,9 @@ class MoeLlm:
             return api_style == "responses"
         return self.model_info.get("url", "").rstrip("/").endswith("/responses")
 
+    def _use_agy_acp(self) -> bool:
+        return self.model_info.get("api_style") == "agy_acp"
+
     def _use_native_web_search(self) -> bool:
         return bool(self.model_info.get("use_native_web_search"))
 
@@ -298,7 +325,11 @@ class MoeLlm:
         return config.get("edit_url") or generation_url.replace("/generations", "/edits")
 
     def _supports_image_input(self) -> bool:
-        return bool(self.model_info.get("is_vision") or self._use_responses_api())
+        return bool(
+            self.model_info.get("is_vision")
+            or self._use_responses_api()
+            or self._use_agy_acp()
+        )
 
     def prompt_handler(self):
         recent_context = list(context_dict[self.session_key])[:-1]
@@ -2192,14 +2223,141 @@ class MoeLlm:
             return False
         return True
 
+    async def _build_agy_acp_prompt_blocks(
+        self, session, send_message_list: list[dict]
+    ) -> list[dict]:
+        schema_json = json.dumps(
+            self._get_response_schema()["schema"], ensure_ascii=False
+        )
+        blocks: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"{self.prompt}\n\n"
+                    "请严格只输出一个符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释或 markdown 代码块：\n"
+                    f"{schema_json}"
+                ),
+            }
+        ]
+
+        fetched_image_content = await self._build_fetched_image_content(session)
+        if fetched_image_content:
+            blocks.extend(responses_content_to_acp_blocks(fetched_image_content))
+
+        for message in send_message_list[:-1]:
+            role = str(message.get("role") or "user")
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                blocks.append({"type": "text", "text": f"[{role}] {content}"})
+            elif isinstance(content, list):
+                converted = responses_content_to_acp_blocks(content)
+                if converted:
+                    blocks.append({"type": "text", "text": f"[{role}]"})
+                    blocks.extend(converted)
+
+        user_ref_content = self._build_user_ref_content()
+        if user_ref_content:
+            blocks.extend(responses_content_to_acp_blocks(user_ref_content))
+
+        avatar_content = await self._build_user_avatar_content(session)
+        if avatar_content:
+            blocks.extend(responses_content_to_acp_blocks(avatar_content))
+
+        current_message = send_message_list[-1]
+        current_text = str(current_message.get("content") or "")
+        if not (self._supports_image_input() and self.messages_handler.current_images):
+            blocks.extend(responses_content_to_acp_blocks(current_text))
+            return blocks
+
+        prepared_images = await self._prepare_current_images(session)
+        markers = ["[图片暂不可用]"] * len(self.messages_handler.current_images)
+        new_images = []
+        for image in prepared_images:
+            source_index = image["source_index"]
+            if image["known"]:
+                markers[source_index] = build_image_reference(image["summary"])
+            else:
+                markers[source_index] = f"[image:{image['image_id']}]"
+                new_images.append(image)
+
+        current_text = replace_image_placeholders(current_text, markers)
+        current_content = [{"type": "input_text", "text": current_text}]
+        for image in new_images:
+            current_content.append(
+                {
+                    "type": "input_text",
+                    "text": f"Attachment for [image:{image['image_id']}]",
+                }
+            )
+            current_content.append(
+                {
+                    "type": "input_image",
+                    "image_url": image["data_url"],
+                }
+            )
+        blocks.extend(responses_content_to_acp_blocks(current_content))
+        return blocks
+
+    async def agy_acp_llm_chat(
+        self, session, send_message_list: list[dict]
+    ) -> str | bool:
+        prompt_blocks = await self._build_agy_acp_prompt_blocks(
+            session, send_message_list
+        )
+        client = get_shared_acp_client()
+        turn_result = await client.run_turn(
+            prompt_blocks=prompt_blocks,
+            model_info=self.model_info,
+        )
+
+        assistant_reply, image_memories = self._extract_structured_assistant_output(
+            turn_result.text
+        )
+        generated_images = turn_result.images or []
+
+        if not assistant_reply and not generated_images:
+            if self.fetched_images and self._looks_like_recent_image_request():
+                return f"这轮模型没返回文本或图片；我这边只取到了 {len(self.fetched_images)} 张群缓存图。"
+            return "模型返回了空结果，请再试一次。"
+
+        self._apply_image_memory_updates(image_memories)
+        self._sync_group_context_with_current_user_message()
+        if not self.is_objective and assistant_reply:
+            self.messages_handler.post_process(assistant_reply)
+
+        sent_images = 0
+        image_model_label = str(self.model_info.get("model") or DEFAULT_AGY_MODEL)
+        for img_bytes in generated_images:
+            await self._send_image_with_metadata(
+                img_bytes,
+                model=image_model_label,
+                scale="auto",
+            )
+            sent_images += 1
+
+        if sent_images > 0 and self._is_redundant_image_completion_reply(assistant_reply):
+            assistant_reply = ""
+        if assistant_reply:
+            await self._send_text_response(assistant_reply)
+        elif sent_images == 0:
+            return False
+        return True
+
     async def get_llm_chat(self) -> str | bool:
         self.messages_handler = MessagesHandler(self.user_id)
         self.messages_handler.pre_process(self.format_message_dict)
-        self.model_info = model_selector.get_model("selected_model")
+        is_big_doubao = self.use_big_doubao or contains_big_doubao_trigger(
+            _extract_event_plain_text(self.event, self.format_message_dict)
+        )
+        self.model_info = (
+            model_selector.get_big_doubao_model()
+            if is_big_doubao
+            else model_selector.get_model("selected_model")
+        )
         if not self.model_info:
             return "未找到可用模型配置。"
 
-        logger.info(f"模型选择为：{self.model_info['model']}")
+        logger.info(f"模型选择为：{self.model_info.get('model', DEFAULT_AGY_MODEL)}")
         self.prompt_handler()
         send_message_list = self.messages_handler.get_send_message_list()
 
@@ -2210,16 +2368,17 @@ class MoeLlm:
         )
         use_external_image_generation = self._use_external_image_generation()
 
-        headers = self._merge_headers({
-            "Authorization": self.model_info["key"],
-            "Content-Type": "application/json",
-            "Accept-Encoding": "identity",
-        }, self._provider_extra_headers())
-
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300)
         ) as session:
             try:
+                if self._use_agy_acp():
+                    return await self.agy_acp_llm_chat(session, send_message_list)
+                headers = self._merge_headers({
+                    "Authorization": self.model_info["key"],
+                    "Content-Type": "application/json",
+                    "Accept-Encoding": "identity",
+                }, self._provider_extra_headers())
                 if self._use_responses_api():
                     return await self.responses_llm_chat(
                         self.model_info["url"],

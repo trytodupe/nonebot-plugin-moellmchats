@@ -67,6 +67,12 @@ class ModelSelector:
                     "reasoning_effort": "low",
                     "verbosity": "low",
                 },
+                "agy-acp": {
+                    "model": "gemini-4-hydrogen-medium",
+                    "api_style": "agy_acp",
+                    "thought_level": "medium",
+                    "mode": "default",
+                },
             }
             self.models_file.parent.mkdir(parents=True, exist_ok=True)
             self.models_file.touch()
@@ -86,6 +92,7 @@ class ModelSelector:
                 "use_moe": False,
                 "moe_models": {"0": "glm", "1": "glm", "2": "glm"},
                 "selected_model": "dpsk-chat",
+                "big_doubao_model": "agy-acp",
                 "category_model": "glm",
                 "vision_model": "",  # 专门处理视觉任务的模型，默认不使用
                 "use_web_search": False,
@@ -146,6 +153,15 @@ class ModelSelector:
         selected_model = self.model_config.get(key)
         if selected_model and selected_model in self.models:
             return self.models[selected_model]
+
+    def get_big_doubao_model(self) -> dict | None:
+        configured = self.model_config.get("big_doubao_model")
+        if configured and configured in self.models:
+            return self.models[configured]
+        for model_info in self.models.values():
+            if isinstance(model_info, dict) and model_info.get("api_style") == "agy_acp":
+                return model_info
+        return None
 
     def get_moe_current_model(self, difficulty: str) -> dict:
         # 获取当前MOE模型的配置
