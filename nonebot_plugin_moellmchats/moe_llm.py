@@ -2310,9 +2310,19 @@ class MoeLlm:
             session, send_message_list
         )
         client = get_shared_acp_client()
+        interim_sent = False
+
+        async def _send_interim_text(raw_text: str) -> None:
+            nonlocal interim_sent
+            interim_reply, _ = self._extract_structured_assistant_output(raw_text)
+            if interim_reply:
+                interim_sent = True
+                await self._send_text_response(interim_reply)
+
         turn_result = await client.run_turn(
             prompt_blocks=prompt_blocks,
             model_info=self.model_info,
+            on_interim_text=_send_interim_text,
         )
 
         assistant_reply, image_memories = self._extract_structured_assistant_output(
@@ -2346,7 +2356,7 @@ class MoeLlm:
             assistant_reply = ""
         if assistant_reply:
             await self._send_text_response(assistant_reply)
-        elif sent_images == 0:
+        elif sent_images == 0 and not interim_sent:
             return False
         return True
 

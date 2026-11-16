@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 try:
     from nonebot.log import logger
@@ -554,6 +554,7 @@ class AgyAcpClient:
         *,
         prompt_blocks: list[dict[str, Any]],
         model_info: dict[str, Any] | None = None,
+        on_interim_text: Callable[[str], Awaitable[None]] | None = None,
     ) -> AcpTurnResult:
         model_info = model_info or {}
         async with self._lock:
@@ -665,6 +666,11 @@ class AgyAcpClient:
                 initial_text = "".join(self._session_text_chunks.get(session_id, []))
 
                 if self._session_image_subagent_called.get(session_id) and not collected_images:
+                    if on_interim_text is not None and initial_text.strip():
+                        try:
+                            await on_interim_text(initial_text)
+                        except Exception:
+                            logger.warning("agy_acp interim text callback failed")
                     self._session_text_chunks[session_id] = []
                     loop = asyncio.get_running_loop()
                     deadline = loop.time() + min(self.timeout_seconds, 90.0)
