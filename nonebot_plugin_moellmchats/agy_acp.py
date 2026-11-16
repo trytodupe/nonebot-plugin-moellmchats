@@ -544,6 +544,21 @@ class AgyAcpClient:
             existing_cwd_files = {
                 p for p in self._cwd_dir.rglob("*") if p.is_file()
             }
+            brain_root = self._gemini_dir / "antigravity-cli" / "brain"
+            conv_root = self._gemini_dir / "antigravity-cli" / "conversations"
+            existing_brain_dirs = (
+                {p for p in brain_root.iterdir() if p.is_dir()}
+                if brain_root.exists()
+                else set()
+            )
+            existing_brain_files = (
+                {p for p in brain_root.rglob("*") if p.is_file()}
+                if brain_root.exists()
+                else set()
+            )
+            existing_conv_entries = (
+                set(conv_root.iterdir()) if conv_root.exists() else set()
+            )
 
             session_res = await self._send_request(
                 "session/new",
@@ -606,9 +621,9 @@ class AgyAcpClient:
                             except Exception:
                                 pass
 
-                brain_dir = self._gemini_dir / "antigravity-cli" / "brain" / session_id
                 brain_images, _ = _extract_images_from_dir(
-                    brain_dir,
+                    brain_root,
+                    ignore_paths=existing_brain_files,
                     ignore_dir_names={".user_uploaded", ".system_generated"},
                 )
                 cwd_images, cwd_image_paths = _extract_images_from_dir(
@@ -644,6 +659,20 @@ class AgyAcpClient:
                 except Exception:
                     pass
                 cleanup_session_files(self._gemini_dir, session_id)
+                if brain_root.exists():
+                    for p in brain_root.iterdir():
+                        if p.is_dir() and p not in existing_brain_dirs:
+                            shutil.rmtree(p, ignore_errors=True)
+                if conv_root.exists():
+                    for p in conv_root.iterdir():
+                        if p not in existing_conv_entries:
+                            if p.is_dir():
+                                shutil.rmtree(p, ignore_errors=True)
+                            else:
+                                try:
+                                    p.unlink()
+                                except OSError:
+                                    pass
 
 
 _shared_acp_client: AgyAcpClient | None = None
