@@ -251,14 +251,18 @@ def _extract_images_from_dir(
     root_dir: Path,
     *,
     ignore_paths: set[Path] | None = None,
+    ignore_dir_names: set[str] | None = None,
 ) -> tuple[list[bytes], list[Path]]:
     if not root_dir.exists():
         return [], []
     images: list[bytes] = []
     found_paths: list[Path] = []
     ignored = ignore_paths or set()
+    ignored_dirs = ignore_dir_names or set()
     for path in sorted(root_dir.rglob("*")):
         if not path.is_file():
+            continue
+        if ignored_dirs and any(part in ignored_dirs for part in path.relative_to(root_dir).parts[:-1]):
             continue
         if path in ignored:
             continue
@@ -591,9 +595,22 @@ class AgyAcpClient:
                 seen_hashes = {
                     hashlib.sha256(img).hexdigest() for img in collected_images
                 }
+                for block in prompt_blocks:
+                    if isinstance(block, dict) and block.get("type") == "image":
+                        b64_data = block.get("data")
+                        if isinstance(b64_data, str) and b64_data:
+                            try:
+                                seen_hashes.add(
+                                    hashlib.sha256(base64.b64decode(b64_data)).hexdigest()
+                                )
+                            except Exception:
+                                pass
 
                 brain_dir = self._gemini_dir / "antigravity-cli" / "brain" / session_id
-                brain_images, _ = _extract_images_from_dir(brain_dir)
+                brain_images, _ = _extract_images_from_dir(
+                    brain_dir,
+                    ignore_dir_names={".user_uploaded", ".system_generated"},
+                )
                 cwd_images, cwd_image_paths = _extract_images_from_dir(
                     self._cwd_dir,
                     ignore_paths=existing_cwd_files,

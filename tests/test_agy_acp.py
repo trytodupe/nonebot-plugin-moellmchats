@@ -370,6 +370,21 @@ class AgyAcpTest(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_ignores_user_uploaded_and_input_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain_dir = Path(tmp) / "brain" / "sess-x"
+            (brain_dir / ".user_uploaded").mkdir(parents=True)
+            (brain_dir / ".system_generated").mkdir(parents=True)
+            (brain_dir / ".user_uploaded" / "input.png").write_bytes(b"user-input")
+            (brain_dir / ".system_generated" / "sys.png").write_bytes(b"sys-img")
+            (brain_dir / "generated.png").write_bytes(b"gen-img")
+
+            images, _ = agy_acp._extract_images_from_dir(
+                brain_dir,
+                ignore_dir_names={".user_uploaded", ".system_generated"},
+            )
+            self.assertEqual(images, [b"gen-img"])
+
 
 if __name__ == "__main__":
     unittest.main()
