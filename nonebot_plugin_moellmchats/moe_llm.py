@@ -2234,6 +2234,11 @@ class MoeLlm:
                 "type": "text",
                 "text": (
                     f"{self.prompt}\n\n"
+                    "可用工具说明：\n"
+                    "- 需要联网检索或查实时信息时，可使用 search_web。\n"
+                    "- 需要生成图片时，请调用 invoke_subagent（TypeName=\"image-generator\"）生成图片文件；"
+                    "系统会自动把生成的图片发送给群聊用户，请勿声称自己无法生成或发送图片。\n"
+                    "- 请勿调用文件读写或终端命令工具。\n\n"
                     "请严格只输出一个符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释或 markdown 代码块：\n"
                     f"{schema_json}"
                 ),
