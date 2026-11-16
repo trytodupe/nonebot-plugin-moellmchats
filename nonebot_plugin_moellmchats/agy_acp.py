@@ -664,11 +664,13 @@ class AgyAcpClient:
 
                 collected_images, cwd_image_paths = _collect_turn_images()
                 initial_text = "".join(self._session_text_chunks.get(session_id, []))
+                interim_sent = False
 
                 if self._session_image_subagent_called.get(session_id) and not collected_images:
                     if on_interim_text is not None and initial_text.strip():
                         try:
                             await on_interim_text(initial_text)
+                            interim_sent = True
                         except Exception:
                             logger.warning("agy_acp interim text callback failed")
                     self._session_text_chunks[session_id] = []
@@ -696,7 +698,12 @@ class AgyAcpClient:
                             elif (now - image_seen_at) >= 10.0:
                                 break
 
-                text_reply = "".join(self._session_text_chunks.get(session_id, [])) or initial_text
+                final_chunks_text = "".join(self._session_text_chunks.get(session_id, []))
+                text_reply = (
+                    final_chunks_text
+                    if interim_sent
+                    else (final_chunks_text or initial_text)
+                )
 
                 for p in cwd_image_paths:
                     try:
