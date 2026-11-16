@@ -297,6 +297,7 @@ class AgyAcpClient:
         self._pending: dict[int | str, asyncio.Future] = {}
         self._session_text_chunks: dict[str, list[str]] = {}
         self._session_images: dict[str, list[bytes]] = {}
+        self._session_image_subagent_called: dict[str, bool] = {}
         self._initialized = False
         self._gemini_dir: Path | None = None
         self._cwd_dir: Path | None = None
@@ -466,13 +467,21 @@ class AgyAcpClient:
 
         if method == "session/request_permission":
             allowed, option_id = evaluate_permission_request(params)
+            tool_call = params.get("toolCall") or {}
+            tool_label = tool_call.get("title") or tool_call.get("name")
+            if allowed and _normalize_tool_identifier(tool_label) != "search_web":
+                req_sid = str(params.get("sessionId") or "")
+                if req_sid:
+                    self._session_image_subagent_called[req_sid] = True
+                else:
+                    for active_sid in self._session_text_chunks:
+                        self._session_image_subagent_called[active_sid] = True
             logger.info(
                 {
                     "event": "agy_acp_permission",
                     "allowed": allowed,
                     "option_id": option_id,
-                    "tool": (params.get("toolCall") or {}).get("title")
-                    or (params.get("toolCall") or {}).get("name"),
+                    "tool": tool_label,
                 }
             )
             await self._write_json(
@@ -507,6 +516,16 @@ class AgyAcpClient:
             return
 
         update_type = update.get("sessionUpdate") or update.get("type")
+        if update_type in ("tool_call", "tool_call_update"):
+            raw_title = str(update.get("title") or update.get("name") or "").lower()
+            raw_input = str(update.get("rawInput") or "").lower()
+            if any(
+                marker in raw_title or marker in raw_input
+                for marker in ("image-generator", "image_generator", "generate_image")
+            ):
+                self._session_image_subagent_called[session_id] = True
+            return
+
         if update_type not in ("agent_message_chunk", "agent_message"):
             return
 
@@ -573,6 +592,7 @@ class AgyAcpClient:
 
             self._session_text_chunks[session_id] = []
             self._session_images[session_id] = []
+            self._session_image_subagent_called[session_id] = False
 
             try:
                 model_value = str(model_info.get("model") or DEFAULT_AGY_MODEL).strip()
@@ -605,36 +625,72 @@ class AgyAcpClient:
                     },
                 )
 
-                text_reply = "".join(self._session_text_chunks.get(session_id, []))
-                collected_images = list(self._session_images.get(session_id, []))
-                seen_hashes = {
-                    hashlib.sha256(img).hexdigest() for img in collected_images
-                }
+                input_hashes: set[str] = set()
                 for block in prompt_blocks:
                     if isinstance(block, dict) and block.get("type") == "image":
                         b64_data = block.get("data")
                         if isinstance(b64_data, str) and b64_data:
                             try:
-                                seen_hashes.add(
+                                input_hashes.add(
                                     hashlib.sha256(base64.b64decode(b64_data)).hexdigest()
                                 )
                             except Exception:
                                 pass
 
-                brain_images, _ = _extract_images_from_dir(
-                    brain_root,
-                    ignore_paths=existing_brain_files,
-                    ignore_dir_names={".user_uploaded", ".system_generated"},
-                )
-                cwd_images, cwd_image_paths = _extract_images_from_dir(
-                    self._cwd_dir,
-                    ignore_paths=existing_cwd_files,
-                )
-                for img in brain_images + cwd_images:
-                    digest = hashlib.sha256(img).hexdigest()
-                    if digest not in seen_hashes:
-                        seen_hashes.add(digest)
-                        collected_images.append(img)
+                def _collect_turn_images() -> tuple[list[bytes], list[Path]]:
+                    found: list[bytes] = []
+                    hashes = set(input_hashes)
+                    for img in self._session_images.get(session_id, []):
+                        digest = hashlib.sha256(img).hexdigest()
+                        if digest not in hashes:
+                            hashes.add(digest)
+                            found.append(img)
+                    b_imgs, _ = _extract_images_from_dir(
+                        brain_root,
+                        ignore_paths=existing_brain_files,
+                        ignore_dir_names={".user_uploaded", ".system_generated"},
+                    )
+                    c_imgs, c_paths = _extract_images_from_dir(
+                        self._cwd_dir,
+                        ignore_paths=existing_cwd_files,
+                    )
+                    for img in b_imgs + c_imgs:
+                        digest = hashlib.sha256(img).hexdigest()
+                        if digest not in hashes:
+                            hashes.add(digest)
+                            found.append(img)
+                    return found, c_paths
+
+                collected_images, cwd_image_paths = _collect_turn_images()
+                initial_text = "".join(self._session_text_chunks.get(session_id, []))
+
+                if self._session_image_subagent_called.get(session_id) and not collected_images:
+                    self._session_text_chunks[session_id] = []
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + min(self.timeout_seconds, 90.0)
+                    image_seen_at: float | None = None
+                    last_text_len = 0
+                    text_stable_since: float | None = None
+                    while loop.time() < deadline:
+                        await asyncio.sleep(0.4)
+                        collected_images, cwd_image_paths = _collect_turn_images()
+                        cur_text_len = sum(
+                            len(t) for t in self._session_text_chunks.get(session_id, [])
+                        )
+                        now = loop.time()
+                        if collected_images:
+                            if image_seen_at is None:
+                                image_seen_at = now
+                            if cur_text_len > 0:
+                                if cur_text_len != last_text_len:
+                                    last_text_len = cur_text_len
+                                    text_stable_since = now
+                                elif text_stable_since is not None and (now - text_stable_since) >= 0.8:
+                                    break
+                            elif (now - image_seen_at) >= 10.0:
+                                break
+
+                text_reply = "".join(self._session_text_chunks.get(session_id, [])) or initial_text
 
                 for p in cwd_image_paths:
                     try:
@@ -650,6 +706,7 @@ class AgyAcpClient:
             finally:
                 self._session_text_chunks.pop(session_id, None)
                 self._session_images.pop(session_id, None)
+                self._session_image_subagent_called.pop(session_id, None)
                 try:
                     if self._proc is not None and getattr(self._proc, "returncode", None) is None:
                         await self._send_request(
