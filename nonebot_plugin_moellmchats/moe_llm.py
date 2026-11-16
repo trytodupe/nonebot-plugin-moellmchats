@@ -2326,7 +2326,9 @@ class MoeLlm:
             self.messages_handler.post_process(assistant_reply)
 
         sent_images = 0
-        image_model_label = str(self.model_info.get("model") or DEFAULT_AGY_MODEL)
+        image_model_label = str(
+            self.model_info.get("image_generation_model") or "agy-image-generator"
+        ).strip()
         for img_bytes in generated_images:
             await self._send_image_with_metadata(
                 img_bytes,
