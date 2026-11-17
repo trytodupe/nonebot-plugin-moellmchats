@@ -157,20 +157,8 @@ def _is_big_doubao_request(
     event: MessageEvent,
     format_message_dict: dict | None = None,
 ) -> bool:
-    get_message = getattr(event, "get_message", None)
-    plain_text = ""
-    if callable(get_message):
-        try:
-            plain_text = str(get_message().extract_plain_text() or "")
-        except Exception:
-            plain_text = ""
-    if not plain_text and isinstance(format_message_dict, dict):
-        plain_text = "".join(str(part) for part in (format_message_dict.get("text") or []))
-    if contains_big_doubao_trigger(plain_text):
-        return True
-    if contains_doubao_help_trigger(plain_text):
-        return False
-    return False
+    plain_text = llm._extract_event_plain_text(event, format_message_dict)
+    return contains_big_doubao_trigger(plain_text)
 
 
 async def handle_llm(

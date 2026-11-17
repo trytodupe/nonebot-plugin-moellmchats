@@ -1721,10 +1721,17 @@ class MoeLlm:
             )
 
         current_message = send_message_list[-1]
-        current_text = current_message["content"]
+        current_content = await self._build_current_message_content(
+            session, str(current_message.get("content") or "")
+        )
+        input_items.append({"role": "user", "content": current_content})
+        return input_items
+
+    async def _build_current_message_content(
+        self, session, current_text: str
+    ) -> str | list[dict]:
         if not (self._supports_image_input() and self.messages_handler.current_images):
-            input_items.append({"role": "user", "content": current_text})
-            return input_items
+            return current_text
 
         prepared_images = await self._prepare_current_images(session)
         markers = ["[图片暂不可用]"] * len(self.messages_handler.current_images)
@@ -1738,7 +1745,7 @@ class MoeLlm:
                 new_images.append(image)
 
         current_text = replace_image_placeholders(current_text, markers)
-        current_content = [{"type": "input_text", "text": current_text}]
+        current_content: list[dict] = [{"type": "input_text", "text": current_text}]
         for image in new_images:
             current_content.append(
                 {
@@ -1752,8 +1759,7 @@ class MoeLlm:
                     "image_url": image["data_url"],
                 }
             )
-        input_items.append({"role": "user", "content": current_content})
-        return input_items
+        return current_content
 
     def _apply_image_memory_updates(self, image_memories: list[dict]):
         summary_map = {}
@@ -2236,7 +2242,7 @@ class MoeLlm:
                     f"{self.prompt}\n\n"
                     "可用工具说明：\n"
                     "- 需要联网检索或查实时信息时，可使用 search_web。\n"
-                    "- 需要生成图片时，请调用 invoke_subagent（TypeName=\"image-generator\"）生成图片文件；"
+                    "- 需要生成或编辑图片时，请直接调用 generate_image 工具生成图片；"
                     "系统会自动把生成的图片发送给群聊用户，请勿声称自己无法生成或发送图片。\n"
                     "- 请勿调用文件读写或终端命令工具。\n\n"
                     "请严格只输出一个符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释或 markdown 代码块：\n"
@@ -2269,37 +2275,9 @@ class MoeLlm:
             blocks.extend(responses_content_to_acp_blocks(avatar_content))
 
         current_message = send_message_list[-1]
-        current_text = str(current_message.get("content") or "")
-        if not (self._supports_image_input() and self.messages_handler.current_images):
-            blocks.extend(responses_content_to_acp_blocks(current_text))
-            return blocks
-
-        prepared_images = await self._prepare_current_images(session)
-        markers = ["[图片暂不可用]"] * len(self.messages_handler.current_images)
-        new_images = []
-        for image in prepared_images:
-            source_index = image["source_index"]
-            if image["known"]:
-                markers[source_index] = build_image_reference(image["summary"])
-            else:
-                markers[source_index] = f"[image:{image['image_id']}]"
-                new_images.append(image)
-
-        current_text = replace_image_placeholders(current_text, markers)
-        current_content = [{"type": "input_text", "text": current_text}]
-        for image in new_images:
-            current_content.append(
-                {
-                    "type": "input_text",
-                    "text": f"Attachment for [image:{image['image_id']}]",
-                }
-            )
-            current_content.append(
-                {
-                    "type": "input_image",
-                    "image_url": image["data_url"],
-                }
-            )
+        current_content = await self._build_current_message_content(
+            session, str(current_message.get("content") or "")
+        )
         blocks.extend(responses_content_to_acp_blocks(current_content))
         return blocks
 
@@ -2310,24 +2288,28 @@ class MoeLlm:
             session, send_message_list
         )
         client = get_shared_acp_client()
-        interim_sent = False
-
-        async def _send_interim_text(raw_text: str) -> None:
-            nonlocal interim_sent
-            interim_reply, _ = self._extract_structured_assistant_output(raw_text)
-            if interim_reply:
-                interim_sent = True
-                await self._send_text_response(interim_reply)
-
         turn_result = await client.run_turn(
             prompt_blocks=prompt_blocks,
             model_info=self.model_info,
-            on_interim_text=_send_interim_text,
+            on_image_generation_start=self.send_generation_notice_event_once,
         )
 
-        assistant_reply, image_memories = self._extract_structured_assistant_output(
-            turn_result.text
+        raw_steps = turn_result.text_steps or (
+            [turn_result.text] if turn_result.text else []
         )
+        assistant_reply = ""
+        merged_memories: dict[str, dict] = {}
+        for step_text in raw_steps:
+            step_reply, step_memories = self._extract_structured_assistant_output(
+                step_text
+            )
+            if step_reply:
+                assistant_reply = step_reply
+            for item in step_memories:
+                image_id = item.get("client_image_id")
+                if image_id and item.get("summary"):
+                    merged_memories[image_id] = item
+        image_memories = list(merged_memories.values())
         generated_images = turn_result.images or []
 
         if not assistant_reply and not generated_images:
@@ -2356,7 +2338,7 @@ class MoeLlm:
             assistant_reply = ""
         if assistant_reply:
             await self._send_text_response(assistant_reply)
-        elif sent_images == 0 and not interim_sent:
+        elif sent_images == 0:
             return False
         return True
 

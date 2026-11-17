@@ -19,19 +19,28 @@ except ImportError:  # pragma: no cover - fallback for standalone unit tests
 
 
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
+DEFAULT_AGY_AGENT_NAME = "doubao"
 DEFAULT_ACP_TIMEOUT_SECONDS = 300.0
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
+_SAVED_IMAGE_PATH_RE = re.compile(r"Generated image is saved at\s+([^\r\n]+?)(?:\.\s*$|$)")
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+_DOUBAO_AGENT_MD = """---
+name: doubao
+description: QQ group chat assistant with web search and direct image generation
+mainAgent: true
+subagent: false
+tools:
+  - search_web
+  - generate_image
+---
+
+# Instructions
+You are a QQ group chat assistant. Use `search_web` for live web information and `generate_image` directly when asked to generate or edit an image.
+"""
 
 _ALLOWED_DIRECT_TOOLS = {
     "search_web",
-    "generate_image",
-    "image-generator",
-    "image_generator",
-}
-_ALLOWED_IMAGE_SUBAGENTS = {
-    "image-generator",
-    "image_generator",
     "generate_image",
 }
 _DENIED_TOOLS = {
@@ -39,6 +48,9 @@ _DENIED_TOOLS = {
     "read_file",
     "write_file",
     "edit_file",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
     "manage_task",
     "run_workflow",
     "swarm",
@@ -56,6 +68,7 @@ class AcpTurnResult:
     text: str
     images: list[bytes] = field(default_factory=list)
     session_id: str | None = None
+    text_steps: list[str] = field(default_factory=list)
 
 
 def get_agy_runtime_dir() -> Path:
@@ -75,7 +88,13 @@ def prepare_agy_runtime(
     app_data_dir = gemini_dir / "antigravity-cli"
     cwd_dir = base_dir / "cwd"
     app_data_dir.mkdir(parents=True, exist_ok=True)
-    cwd_dir.mkdir(parents=True, exist_ok=True)
+    (cwd_dir / ".git").mkdir(parents=True, exist_ok=True)
+
+    agents_dir = cwd_dir / ".agents" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    agent_file = agents_dir / f"{DEFAULT_AGY_AGENT_NAME}.md"
+    if not agent_file.exists() or agent_file.read_text(encoding="utf-8") != _DOUBAO_AGENT_MD:
+        agent_file.write_text(_DOUBAO_AGENT_MD, encoding="utf-8")
 
     src_token = (
         Path(oauth_token_source)
@@ -165,28 +184,8 @@ def _normalize_tool_identifier(raw_name: Any) -> str:
     cleaned = raw_name.strip().lower()
     if not cleaned:
         return ""
-    # Handle titles like "search_web: query" or "run_command (ls)"
     token = re.split(r"[\s:(\[]+", cleaned, maxsplit=1)[0]
     return token
-
-
-def _extract_subagent_target(tool_call: dict[str, Any], params: dict[str, Any]) -> str:
-    raw_input = tool_call.get("rawInput")
-    candidates: list[Any] = []
-    if isinstance(raw_input, dict):
-        for key in ("TypeName", "type_name", "typeName", "subagent", "agent", "name", "tool"):
-            if key in raw_input:
-                candidates.append(raw_input.get(key))
-    for key in ("subagent", "TypeName", "type_name", "typeName"):
-        if key in tool_call:
-            candidates.append(tool_call.get(key))
-        if key in params:
-            candidates.append(params.get(key))
-    for candidate in candidates:
-        normalized = _normalize_tool_identifier(candidate)
-        if normalized:
-            return normalized
-    return ""
 
 
 def _pick_permission_option_id(options: Any, *, allow: bool) -> str:
@@ -234,17 +233,32 @@ def evaluate_permission_request(params: dict[str, Any]) -> tuple[bool, str]:
             tool_name = normalized
             break
 
-    allowed = False
-    if tool_name in _DENIED_TOOLS:
-        allowed = False
-    elif tool_name in _ALLOWED_DIRECT_TOOLS:
-        allowed = True
-    elif tool_name == "invoke_subagent":
-        target = _extract_subagent_target(tool_call, params)
-        allowed = target in _ALLOWED_IMAGE_SUBAGENTS
-
+    allowed = tool_name not in _DENIED_TOOLS and tool_name in _ALLOWED_DIRECT_TOOLS
     option_id = _pick_permission_option_id(params.get("options"), allow=allowed)
     return allowed, option_id
+
+
+def _extract_saved_image_paths_from_update(update: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    locations = update.get("locations")
+    if isinstance(locations, list):
+        for loc in locations:
+            if isinstance(loc, dict) and isinstance(loc.get("path"), str):
+                paths.append(Path(loc["path"]))
+
+    content = update.get("content")
+    items = content if isinstance(content, list) else ([content] if content else [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        inner = item.get("content") if item.get("type") == "content" else item
+        if isinstance(inner, dict) and inner.get("type") == "text":
+            text = str(inner.get("text") or "")
+            for match in _SAVED_IMAGE_PATH_RE.finditer(text):
+                raw_path = match.group(1).strip()
+                if raw_path:
+                    paths.append(Path(raw_path))
+    return paths
 
 
 def _extract_images_from_dir(
@@ -262,7 +276,9 @@ def _extract_images_from_dir(
     for path in sorted(root_dir.rglob("*")):
         if not path.is_file():
             continue
-        if ignored_dirs and any(part in ignored_dirs for part in path.relative_to(root_dir).parts[:-1]):
+        if ignored_dirs and any(
+            part in ignored_dirs for part in path.relative_to(root_dir).parts[:-1]
+        ):
             continue
         if path in ignored:
             continue
@@ -295,9 +311,11 @@ class AgyAcpClient:
         self._reader_task: asyncio.Task | None = None
         self._next_id = 1
         self._pending: dict[int | str, asyncio.Future] = {}
-        self._session_text_chunks: dict[str, list[str]] = {}
+        self._session_text_steps: dict[str, list[list[str]]] = {}
         self._session_images: dict[str, list[bytes]] = {}
-        self._session_image_subagent_called: dict[str, bool] = {}
+        self._session_notice_callbacks: dict[str, Callable[[], Awaitable[None]]] = {}
+        self._session_notice_fired: set[str] = set()
+        self._background_tasks: set[asyncio.Task] = set()
         self._initialized = False
         self._gemini_dir: Path | None = None
         self._cwd_dir: Path | None = None
@@ -313,6 +331,8 @@ class AgyAcpClient:
         cmd = [
             "agy",
             "acp",
+            "--agent",
+            DEFAULT_AGY_AGENT_NAME,
             "--disable-telemetry",
             "--gemini-dir",
             str(gemini_dir),
@@ -338,7 +358,11 @@ class AgyAcpClient:
             raise RuntimeError("未找到 agy 命令，无法使用大豆包（agy_acp）。") from exc
 
     async def _ensure_started(self) -> None:
-        if self._proc is not None and getattr(self._proc, "returncode", None) is None and self._initialized:
+        if (
+            self._proc is not None
+            and getattr(self._proc, "returncode", None) is None
+            and self._initialized
+        ):
             return
 
         await self._reset_process()
@@ -416,6 +440,24 @@ class AgyAcpClient:
         finally:
             self._pending.pop(req_id, None)
 
+    def _trigger_image_notice(self, session_id: str) -> None:
+        if not session_id or session_id in self._session_notice_fired:
+            return
+        callback = self._session_notice_callbacks.get(session_id)
+        if callback is None:
+            return
+        self._session_notice_fired.add(session_id)
+
+        async def _run_notice() -> None:
+            try:
+                await callback()
+            except Exception:
+                logger.warning("agy_acp image generation notice callback failed")
+
+        task = asyncio.create_task(_run_notice())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def _reader_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         try:
@@ -468,14 +510,18 @@ class AgyAcpClient:
         if method == "session/request_permission":
             allowed, option_id = evaluate_permission_request(params)
             tool_call = params.get("toolCall") or {}
-            tool_label = tool_call.get("title") or tool_call.get("name")
-            if allowed and _normalize_tool_identifier(tool_label) != "search_web":
+            tool_label = (
+                tool_call.get("toolName")
+                or tool_call.get("name")
+                or tool_call.get("title")
+            )
+            if allowed and _normalize_tool_identifier(tool_label) == "generate_image":
                 req_sid = str(params.get("sessionId") or "")
                 if req_sid:
-                    self._session_image_subagent_called[req_sid] = True
+                    self._trigger_image_notice(req_sid)
                 else:
-                    for active_sid in self._session_text_chunks:
-                        self._session_image_subagent_called[active_sid] = True
+                    for active_sid in self._session_text_steps:
+                        self._trigger_image_notice(active_sid)
             logger.info(
                 {
                     "event": "agy_acp_permission",
@@ -517,13 +563,24 @@ class AgyAcpClient:
 
         update_type = update.get("sessionUpdate") or update.get("type")
         if update_type in ("tool_call", "tool_call_update"):
-            raw_title = str(update.get("title") or update.get("name") or "").lower()
-            raw_input = str(update.get("rawInput") or "").lower()
-            if any(
-                marker in raw_title or marker in raw_input
-                for marker in ("image-generator", "image_generator", "generate_image")
-            ):
-                self._session_image_subagent_called[session_id] = True
+            tool_name = _normalize_tool_identifier(
+                update.get("name") or update.get("toolName") or update.get("title")
+            )
+            if tool_name == "generate_image":
+                self._trigger_image_notice(session_id)
+                if update.get("status") == "completed":
+                    for img_path in _extract_saved_image_paths_from_update(update):
+                        if img_path.is_file():
+                            try:
+                                self._session_images.setdefault(session_id, []).append(
+                                    img_path.read_bytes()
+                                )
+                                img_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+            steps = self._session_text_steps.setdefault(session_id, [[]])
+            if steps and steps[-1]:
+                steps.append([])
             return
 
         if update_type not in ("agent_message_chunk", "agent_message"):
@@ -538,7 +595,8 @@ class AgyAcpClient:
             if item_type == "text":
                 text = item.get("text")
                 if isinstance(text, str) and text:
-                    self._session_text_chunks.setdefault(session_id, []).append(text)
+                    steps = self._session_text_steps.setdefault(session_id, [[]])
+                    steps[-1].append(text)
             elif item_type == "image":
                 b64_data = item.get("data")
                 if isinstance(b64_data, str) and b64_data:
@@ -554,7 +612,7 @@ class AgyAcpClient:
         *,
         prompt_blocks: list[dict[str, Any]],
         model_info: dict[str, Any] | None = None,
-        on_interim_text: Callable[[str], Awaitable[None]] | None = None,
+        on_image_generation_start: Callable[[], Awaitable[None]] | None = None,
     ) -> AcpTurnResult:
         model_info = model_info or {}
         async with self._lock:
@@ -564,21 +622,6 @@ class AgyAcpClient:
             existing_cwd_files = {
                 p for p in self._cwd_dir.rglob("*") if p.is_file()
             }
-            brain_root = self._gemini_dir / "antigravity-cli" / "brain"
-            conv_root = self._gemini_dir / "antigravity-cli" / "conversations"
-            existing_brain_dirs = (
-                {p for p in brain_root.iterdir() if p.is_dir()}
-                if brain_root.exists()
-                else set()
-            )
-            existing_brain_files = (
-                {p for p in brain_root.rglob("*") if p.is_file()}
-                if brain_root.exists()
-                else set()
-            )
-            existing_conv_entries = (
-                set(conv_root.iterdir()) if conv_root.exists() else set()
-            )
 
             session_res = await self._send_request(
                 "session/new",
@@ -591,9 +634,10 @@ class AgyAcpClient:
             if not session_id:
                 raise RuntimeError("agy acp 未返回有效的 sessionId。")
 
-            self._session_text_chunks[session_id] = []
+            self._session_text_steps[session_id] = [[]]
             self._session_images[session_id] = []
-            self._session_image_subagent_called[session_id] = False
+            if on_image_generation_start is not None:
+                self._session_notice_callbacks[session_id] = on_image_generation_start
 
             try:
                 model_value = str(model_info.get("model") or DEFAULT_AGY_MODEL).strip()
@@ -638,72 +682,29 @@ class AgyAcpClient:
                             except Exception:
                                 pass
 
-                def _collect_turn_images() -> tuple[list[bytes], list[Path]]:
-                    found: list[bytes] = []
-                    hashes = set(input_hashes)
-                    for img in self._session_images.get(session_id, []):
-                        digest = hashlib.sha256(img).hexdigest()
-                        if digest not in hashes:
-                            hashes.add(digest)
-                            found.append(img)
-                    b_imgs, _ = _extract_images_from_dir(
-                        brain_root,
-                        ignore_paths=existing_brain_files,
-                        ignore_dir_names={".user_uploaded", ".system_generated"},
-                    )
-                    c_imgs, c_paths = _extract_images_from_dir(
-                        self._cwd_dir,
-                        ignore_paths=existing_cwd_files,
-                    )
-                    for img in b_imgs + c_imgs:
-                        digest = hashlib.sha256(img).hexdigest()
-                        if digest not in hashes:
-                            hashes.add(digest)
-                            found.append(img)
-                    return found, c_paths
-
-                collected_images, cwd_image_paths = _collect_turn_images()
-                initial_text = "".join(self._session_text_chunks.get(session_id, []))
-                interim_sent = False
-
-                if self._session_image_subagent_called.get(session_id) and not collected_images:
-                    if on_interim_text is not None and initial_text.strip():
-                        try:
-                            await on_interim_text(initial_text)
-                            interim_sent = True
-                        except Exception:
-                            logger.warning("agy_acp interim text callback failed")
-                    self._session_text_chunks[session_id] = []
-                    loop = asyncio.get_running_loop()
-                    deadline = loop.time() + min(self.timeout_seconds, 90.0)
-                    image_seen_at: float | None = None
-                    last_text_len = 0
-                    text_stable_since: float | None = None
-                    while loop.time() < deadline:
-                        await asyncio.sleep(0.4)
-                        collected_images, cwd_image_paths = _collect_turn_images()
-                        cur_text_len = sum(
-                            len(t) for t in self._session_text_chunks.get(session_id, [])
-                        )
-                        now = loop.time()
-                        if collected_images:
-                            if image_seen_at is None:
-                                image_seen_at = now
-                            if cur_text_len > 0:
-                                if cur_text_len != last_text_len:
-                                    last_text_len = cur_text_len
-                                    text_stable_since = now
-                                elif text_stable_since is not None and (now - text_stable_since) >= 0.8:
-                                    break
-                            elif (now - image_seen_at) >= 10.0:
-                                break
-
-                final_chunks_text = "".join(self._session_text_chunks.get(session_id, []))
-                text_reply = (
-                    final_chunks_text
-                    if interim_sent
-                    else (final_chunks_text or initial_text)
+                session_brain_dir = (
+                    self._gemini_dir / "antigravity-cli" / "brain" / session_id
                 )
+                brain_images, _ = _extract_images_from_dir(
+                    session_brain_dir,
+                    ignore_dir_names={".user_uploaded", ".system_generated", "scratch"},
+                )
+                cwd_images, cwd_image_paths = _extract_images_from_dir(
+                    self._cwd_dir,
+                    ignore_paths=existing_cwd_files,
+                )
+
+                collected_images: list[bytes] = []
+                seen_hashes = set(input_hashes)
+                for img in (
+                    self._session_images.get(session_id, [])
+                    + brain_images
+                    + cwd_images
+                ):
+                    digest = hashlib.sha256(img).hexdigest()
+                    if digest not in seen_hashes:
+                        seen_hashes.add(digest)
+                        collected_images.append(img)
 
                 for p in cwd_image_paths:
                     try:
@@ -711,15 +712,25 @@ class AgyAcpClient:
                     except OSError:
                         pass
 
+                raw_steps = self._session_text_steps.get(session_id, [])
+                text_steps = [
+                    "".join(chunks)
+                    for chunks in raw_steps
+                    if "".join(chunks).strip()
+                ]
+                text_reply = text_steps[-1] if text_steps else ""
+
                 return AcpTurnResult(
                     text=text_reply,
                     images=collected_images,
                     session_id=session_id,
+                    text_steps=text_steps,
                 )
             finally:
-                self._session_text_chunks.pop(session_id, None)
+                self._session_text_steps.pop(session_id, None)
                 self._session_images.pop(session_id, None)
-                self._session_image_subagent_called.pop(session_id, None)
+                self._session_notice_callbacks.pop(session_id, None)
+                self._session_notice_fired.discard(session_id)
                 try:
                     if self._proc is not None and getattr(self._proc, "returncode", None) is None:
                         await self._send_request(
@@ -729,20 +740,6 @@ class AgyAcpClient:
                 except Exception:
                     pass
                 cleanup_session_files(self._gemini_dir, session_id)
-                if brain_root.exists():
-                    for p in brain_root.iterdir():
-                        if p.is_dir() and p not in existing_brain_dirs:
-                            shutil.rmtree(p, ignore_errors=True)
-                if conv_root.exists():
-                    for p in conv_root.iterdir():
-                        if p not in existing_conv_entries:
-                            if p.is_dir():
-                                shutil.rmtree(p, ignore_errors=True)
-                            else:
-                                try:
-                                    p.unlink()
-                                except OSError:
-                                    pass
 
 
 _shared_acp_client: AgyAcpClient | None = None

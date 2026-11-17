@@ -131,6 +131,73 @@ class _FakeAcpProcess:
                 },
             }
         )
+        if self.create_brain_image:
+            self._push(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": self.session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": '{"assistant_reply":"","image_memories":[{"client_image_id":"img1","summary":"cat"}]}',
+                            },
+                        },
+                    },
+                }
+            )
+            brain_dir = (
+                self.runtime_dir
+                / "gemini"
+                / "antigravity-cli"
+                / "brain"
+                / self.session_id
+            )
+            brain_dir.mkdir(parents=True, exist_ok=True)
+            img_path = brain_dir / "generated.png"
+            img_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+            conv_dir = self.runtime_dir / "gemini" / "antigravity-cli" / "conversations"
+            conv_dir.mkdir(parents=True, exist_ok=True)
+            (conv_dir / f"{self.session_id}.db").write_bytes(b"sqlite")
+            self._push(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": self.session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "name": "generate_image",
+                            "status": "in_progress",
+                        },
+                    },
+                }
+            )
+            self._push(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": self.session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "name": "generate_image",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "content",
+                                    "content": {
+                                        "type": "text",
+                                        "text": f"Generated image is saved at {img_path}.",
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
         self._push(
             {
                 "jsonrpc": "2.0",
@@ -147,19 +214,6 @@ class _FakeAcpProcess:
                 },
             }
         )
-        if self.create_brain_image:
-            brain_dir = (
-                self.runtime_dir
-                / "gemini"
-                / "antigravity-cli"
-                / "brain"
-                / self.session_id
-            )
-            brain_dir.mkdir(parents=True, exist_ok=True)
-            (brain_dir / "generated.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
-            conv_dir = self.runtime_dir / "gemini" / "antigravity-cli" / "conversations"
-            conv_dir.mkdir(parents=True, exist_ok=True)
-            (conv_dir / f"{self.session_id}.db").write_bytes(b"sqlite")
 
         self._push({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
 
@@ -184,48 +238,21 @@ class AgyAcpTest(unittest.TestCase):
             {"optionId": "reject_once", "kind": "reject_once"},
         ]
 
-        allowed, opt = agy_acp.evaluate_permission_request(
-            {"toolCall": {"title": "search_web"}, "options": options}
-        )
-        self.assertTrue(allowed)
-        self.assertEqual(opt, "allow_once")
-
-        for img_tool in ("image-generator", "generate_image", "image_generator"):
+        for allowed_tool in ("search_web", "generate_image"):
             allowed, opt = agy_acp.evaluate_permission_request(
-                {"toolCall": {"name": img_tool}, "options": options}
+                {"toolCall": {"name": allowed_tool}, "options": options}
             )
-            self.assertTrue(allowed, msg=img_tool)
+            self.assertTrue(allowed, msg=allowed_tool)
             self.assertEqual(opt, "allow_once")
-
-        allowed, opt = agy_acp.evaluate_permission_request(
-            {
-                "toolCall": {
-                    "name": "invoke_subagent",
-                    "rawInput": {"TypeName": "image-generator"},
-                },
-                "options": options,
-            }
-        )
-        self.assertTrue(allowed)
-        self.assertEqual(opt, "allow_once")
-
-        allowed, opt = agy_acp.evaluate_permission_request(
-            {
-                "toolCall": {
-                    "name": "invoke_subagent",
-                    "rawInput": {"TypeName": "research"},
-                },
-                "options": options,
-            }
-        )
-        self.assertFalse(allowed)
-        self.assertEqual(opt, "reject_once")
 
         for denied_tool in (
             "run_command",
             "read_file",
             "write_file",
             "edit_file",
+            "invoke_subagent",
+            "define_subagent",
+            "manage_subagents",
             "manage_task",
             "run_workflow",
             "swarm",
@@ -272,7 +299,10 @@ class AgyAcpTest(unittest.TestCase):
                 runtime_dir=runtime_dir,
                 oauth_token_source=token_src,
             )
-            self.assertTrue(cwd_dir.is_dir())
+            self.assertTrue((cwd_dir / ".git").is_dir())
+            agent_file = cwd_dir / ".agents" / "agents" / "doubao.md"
+            self.assertTrue(agent_file.is_file())
+            self.assertIn("generate_image", agent_file.read_text(encoding="utf-8"))
             token_dst = gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
             self.assertTrue(token_dst.is_symlink())
             self.assertEqual(token_dst.read_text(encoding="utf-8"), "oauth-secret")
@@ -295,9 +325,16 @@ class AgyAcpTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 runtime_dir = Path(tmp) / "runtime"
                 spawned: list[_FakeAcpProcess] = []
+                spawned_cmds: list[list[str]] = []
+                notice_calls = 0
+
+                async def on_notice():
+                    nonlocal notice_calls
+                    notice_calls += 1
 
                 async def factory(cmd, cwd):
                     idx = len(spawned) + 1
+                    spawned_cmds.append(list(cmd))
                     proc = _FakeAcpProcess(
                         runtime_dir=runtime_dir,
                         session_id=f"sess-{idx}",
@@ -316,9 +353,20 @@ class AgyAcpTest(unittest.TestCase):
                     res1 = await client.run_turn(
                         prompt_blocks=[{"type": "text", "text": "hello"}],
                         model_info={"thought_level": "medium", "mode": "default"},
+                        on_image_generation_start=on_notice,
                     )
+                    self.assertIn("--agent", spawned_cmds[0])
+                    self.assertIn("doubao", spawned_cmds[0])
                     self.assertEqual(res1.text, '{"assistant_reply":"你好","image_memories":[]}')
+                    self.assertEqual(
+                        res1.text_steps,
+                        [
+                            '{"assistant_reply":"","image_memories":[{"client_image_id":"img1","summary":"cat"}]}',
+                            '{"assistant_reply":"你好","image_memories":[]}',
+                        ],
+                    )
                     self.assertEqual(res1.images, [b"\x89PNG\r\n\x1a\nfake"])
+                    self.assertEqual(notice_calls, 1)
                     self.assertEqual(
                         spawned[0].received_methods,
                         [
@@ -343,7 +391,6 @@ class AgyAcpTest(unittest.TestCase):
                         spawned[0].permission_outcomes,
                         [("search_web", "allow_once"), ("run_command", "reject_once")],
                     )
-                    # Session files should be cleaned up
                     self.assertFalse(
                         (runtime_dir / "gemini" / "antigravity-cli" / "brain" / "sess-1").exists()
                     )
@@ -357,7 +404,6 @@ class AgyAcpTest(unittest.TestCase):
                         ).exists()
                     )
 
-                    # Simulate process exit; next turn must auto-restart
                     spawned[0].terminate()
                     res2 = await client.run_turn(
                         prompt_blocks=[{"type": "text", "text": "second"}],
