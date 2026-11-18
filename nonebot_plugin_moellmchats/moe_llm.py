@@ -2,8 +2,10 @@ import base64
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import time
 import traceback
+import uuid
 from asyncio import TimeoutError
 from collections import defaultdict, deque
 
@@ -44,6 +46,7 @@ from .group_context import collect_group_context
 from .agy_acp import (
     DEFAULT_AGY_MODEL,
     close_shared_acp_client,
+    get_agy_runtime_dir,
     get_shared_acp_client,
     responses_content_to_acp_blocks,
 )
@@ -2229,8 +2232,176 @@ class MoeLlm:
             return False
         return True
 
+    def _stage_agy_input_image(
+        self, turn_inputs_dir: Path | None, image_id: str
+    ) -> str | None:
+        if turn_inputs_dir is None or not image_id:
+            return None
+        info = self.image_inputs_by_id.get(image_id)
+        if not info or not info.get("bytes"):
+            return None
+        mime_type = str(info.get("mime_type") or "image/png").lower()
+        ext_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }
+        ext = ext_map.get(mime_type, ".png")
+        turn_inputs_dir.mkdir(parents=True, exist_ok=True)
+        file_path = turn_inputs_dir / f"{image_id}{ext}"
+        try:
+            if not file_path.exists():
+                file_path.write_bytes(info["bytes"])
+            return str(file_path)
+        except OSError:
+            return None
+
+    async def _handle_agy_mcp_tool_call(
+        self,
+        session,
+        turn_inputs_dir: Path,
+        tool_name: str,
+        arguments: dict,
+    ) -> list[dict] | str:
+        normalized = tool_name.strip()
+        if normalized.startswith("mcp_qq_context_"):
+            normalized = normalized[len("mcp_qq_context_") :]
+
+        if normalized == "get_imagegen_instructions":
+            self.imagegen_instructions_provided = True
+            await self.send_generation_notice_event_once()
+            return IMAGEGEN_TOOL_INSTRUCTIONS
+
+        if normalized == "fetch_user_avatar":
+            user_ref = str(arguments.get("user_ref") or "").strip()
+            if not user_ref:
+                return json.dumps(
+                    {"error": "缺少 user_ref 参数。"}, ensure_ascii=False
+                )
+            avatar = await self._prepare_user_avatar(session, user_ref)
+            if not avatar:
+                return json.dumps(
+                    {"error": f"未找到用户引用 {user_ref} 的头像。"},
+                    ensure_ascii=False,
+                )
+            image_id = avatar["image_id"]
+            file_path = self._stage_agy_input_image(turn_inputs_dir, image_id)
+            result_payload = {
+                "user_ref": avatar["user_ref"],
+                "image_id": image_id,
+                "file_path": file_path,
+                "note": "如需将该头像作为生图/改图参考，请将 file_path 传入 generate_image 的 ImagePaths 参数。",
+            }
+            content_blocks: list[dict] = [
+                {
+                    "type": "text",
+                    "text": json.dumps(result_payload, ensure_ascii=False),
+                }
+            ]
+            info = self.image_inputs_by_id.get(image_id)
+            if info and info.get("bytes"):
+                content_blocks.append(
+                    {
+                        "type": "image",
+                        "mimeType": str(info.get("mime_type") or "image/jpeg"),
+                        "data": base64.b64encode(info["bytes"]).decode("ascii"),
+                    }
+                )
+            return content_blocks
+
+        if normalized == "fetch_recent_images":
+            if not self._can_use_group_image_cache():
+                return json.dumps(
+                    {"images": [], "message": "当前会话不支持群图片缓存。"},
+                    ensure_ascii=False,
+                )
+            max_fetch_rounds = int(
+                config_parser.get_config("fetch_recent_images_max_rounds") or 3
+            )
+            if self.fetch_recent_images_rounds >= max_fetch_rounds:
+                return json.dumps(
+                    {
+                        "images": [],
+                        "message": f"已达到本轮最大取图轮次（{max_fetch_rounds}）。",
+                    },
+                    ensure_ascii=False,
+                )
+            max_limit = int(
+                config_parser.get_config("fetch_recent_images_max_limit") or 6
+            )
+            default_limit = int(
+                config_parser.get_config("fetch_recent_images_default_limit") or 3
+            )
+            try:
+                limit = int(arguments.get("limit") or default_limit)
+            except (TypeError, ValueError):
+                limit = default_limit
+            try:
+                offset = int(arguments.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            limit = max(1, min(limit, max_limit))
+            offset = max(0, offset)
+
+            self.fetch_recent_images_rounds += 1
+            fetched = await image_cache.get_recent_group_images(
+                group_id=self.event.group_id,
+                limit=limit,
+                offset=offset,
+            )
+            known_ids = {img.get("image_id") for img in self.fetched_images}
+            self.fetched_images.extend(
+                img for img in fetched if img.get("image_id") not in known_ids
+            )
+            prepared = await self._prepare_images(
+                session, fetched, include_known_images=True
+            )
+            items = []
+            image_blocks: list[dict] = []
+            for img in prepared:
+                image_id = img["image_id"]
+                file_path = self._stage_agy_input_image(turn_inputs_dir, image_id)
+                summary = image_memory_store.get_summary(image_id) or ""
+                items.append(
+                    {
+                        "image_id": image_id,
+                        "file_path": file_path,
+                        "summary": summary,
+                    }
+                )
+                info = self.image_inputs_by_id.get(image_id)
+                if info and info.get("bytes"):
+                    image_blocks.append(
+                        {
+                            "type": "image",
+                            "mimeType": str(info.get("mime_type") or "image/jpeg"),
+                            "data": base64.b64encode(info["bytes"]).decode("ascii"),
+                        }
+                    )
+            return [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "images": items,
+                            "note": "如需引用或编辑某张图，请将其 file_path 传入 generate_image 的 ImagePaths 参数。",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                *image_blocks,
+            ]
+
+        raise ValueError(f"未知的 MCP 工具: {tool_name}")
+
     async def _build_agy_acp_prompt_blocks(
-        self, session, send_message_list: list[dict]
+        self,
+        session,
+        send_message_list: list[dict],
+        *,
+        turn_inputs_dir: Path | None = None,
     ) -> list[dict]:
         schema_json = json.dumps(
             self._get_response_schema()["schema"], ensure_ascii=False
@@ -2242,7 +2413,10 @@ class MoeLlm:
                     f"{self.prompt}\n\n"
                     "可用工具说明：\n"
                     "- 需要联网检索或查实时信息时，可使用 search_web。\n"
-                    "- 需要生成或编辑图片时，请直接调用 generate_image 工具生成图片；"
+                    "- 需要获取群内最近发送的历史图片时，可调用 mcp_qq_context_fetch_recent_images。\n"
+                    "- 需要获取发言人（current_user）或被提及群友（mentioned_user_N）的 QQ 头像时，可调用 mcp_qq_context_fetch_user_avatar。\n"
+                    "- 需要生成或编辑图片前，请先调用 mcp_qq_context_get_imagegen_instructions 获取提示词优化规范，再直接调用 generate_image 工具生成图片；"
+                    "若需基于已有图片或头像进行改图/合成/参考，请将其本地文件路径（file_path）传入 generate_image 的 ImagePaths 参数。"
                     "系统会自动把生成的图片发送给群聊用户，请勿声称自己无法生成或发送图片。\n"
                     "- 请勿调用文件读写或终端命令工具。\n\n"
                     "请严格只输出一个符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释或 markdown 代码块：\n"
@@ -2279,20 +2453,61 @@ class MoeLlm:
             session, str(current_message.get("content") or "")
         )
         blocks.extend(responses_content_to_acp_blocks(current_content))
+
+        if turn_inputs_dir is not None and self.image_inputs_by_id:
+            staged_lines = []
+            for image_id in self.image_inputs_by_id:
+                staged_path = self._stage_agy_input_image(turn_inputs_dir, image_id)
+                if staged_path:
+                    staged_lines.append(f"- [image:{image_id}]: {staged_path}")
+            if staged_lines:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "已就绪的输入图片本地路径（供 generate_image 的 ImagePaths 参数使用）：\n"
+                            + "\n".join(staged_lines)
+                        ),
+                    }
+                )
         return blocks
 
     async def agy_acp_llm_chat(
         self, session, send_message_list: list[dict]
     ) -> str | bool:
-        prompt_blocks = await self._build_agy_acp_prompt_blocks(
-            session, send_message_list
+        turn_inputs_dir = (
+            get_agy_runtime_dir() / "inputs" / uuid.uuid4().hex
         )
-        client = get_shared_acp_client()
-        turn_result = await client.run_turn(
-            prompt_blocks=prompt_blocks,
-            model_info=self.model_info,
-            on_image_generation_start=self.send_generation_notice_event_once,
-        )
+        try:
+            prompt_blocks = await self._build_agy_acp_prompt_blocks(
+                session,
+                send_message_list,
+                turn_inputs_dir=turn_inputs_dir,
+            )
+            client = get_shared_acp_client()
+
+            async def mcp_handler(tool_name: str, arguments: dict):
+                return await self._handle_agy_mcp_tool_call(
+                    session, turn_inputs_dir, tool_name, arguments
+                )
+
+            def get_input_hashes() -> set[str]:
+                return {
+                    hashlib.sha256(info["bytes"]).hexdigest()
+                    for info in self.image_inputs_by_id.values()
+                    if info and info.get("bytes")
+                }
+
+            turn_result = await client.run_turn(
+                prompt_blocks=prompt_blocks,
+                model_info=self.model_info,
+                on_image_generation_start=self.send_generation_notice_event_once,
+                mcp_tool_handler=mcp_handler,
+                extra_input_hashes=get_input_hashes,
+            )
+        finally:
+            if turn_inputs_dir.exists():
+                shutil.rmtree(turn_inputs_dir, ignore_errors=True)
 
         raw_steps = turn_result.text_steps or (
             [turn_result.text] if turn_result.text else []

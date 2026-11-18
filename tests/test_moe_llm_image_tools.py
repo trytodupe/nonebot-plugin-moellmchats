@@ -1197,6 +1197,52 @@ class MoeLlmImageToolsTest(unittest.TestCase):
             [{"client_image_id": "img_1", "summary": "cute gentoo"}],
         )
 
+    def test_agy_mcp_tool_handlers_stage_files_and_return_instructions(self):
+        import tempfile
+
+        llm = self.build_llm()
+        llm.send_generation_notice_event_once = AsyncMock()
+        llm.image_inputs_by_id["img_sha256_avatar1"] = {
+            "bytes": b"avatar-bytes",
+            "mime_type": "image/jpeg",
+            "filename": "image.jpeg",
+        }
+        llm._prepare_user_avatar = AsyncMock(
+            return_value={
+                "user_ref": "current_user",
+                "image_id": "img_sha256_avatar1",
+                "data_url": "data:image/jpeg;base64,"
+                + base64.b64encode(b"avatar-bytes").decode("ascii"),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            turn_dir = Path(tmp) / "inputs"
+            instructions = asyncio.run(
+                llm._handle_agy_mcp_tool_call(
+                    object(), turn_dir, "get_imagegen_instructions", {}
+                )
+            )
+            self.assertEqual(instructions, moe_llm.IMAGEGEN_TOOL_INSTRUCTIONS)
+            self.assertTrue(llm.imagegen_instructions_provided)
+            llm.send_generation_notice_event_once.assert_awaited_once()
+
+            avatar_blocks = asyncio.run(
+                llm._handle_agy_mcp_tool_call(
+                    object(),
+                    turn_dir,
+                    "mcp_qq_context_fetch_user_avatar",
+                    {"user_ref": "current_user"},
+                )
+            )
+            self.assertIsInstance(avatar_blocks, list)
+            payload = json.loads(avatar_blocks[0]["text"])
+            self.assertEqual(payload["user_ref"], "current_user")
+            self.assertEqual(payload["image_id"], "img_sha256_avatar1")
+            staged_file = Path(payload["file_path"])
+            self.assertTrue(staged_file.is_file())
+            self.assertEqual(staged_file.read_bytes(), b"avatar-bytes")
+
 
 if __name__ == "__main__":
     unittest.main()

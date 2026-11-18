@@ -21,27 +21,115 @@ except ImportError:  # pragma: no cover - fallback for standalone unit tests
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
 DEFAULT_AGY_AGENT_NAME = "doubao"
 DEFAULT_ACP_TIMEOUT_SECONDS = 300.0
+MCP_SERVER_NAME = "qq_context"
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
 _SAVED_IMAGE_PATH_RE = re.compile(r"Generated image is saved at\s+([^\r\n]+?)(?:\.\s*$|$)")
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
-_DOUBAO_AGENT_MD = """---
-name: doubao
-description: QQ group chat assistant with web search and direct image generation
-mainAgent: true
-subagent: false
-tools:
-  - search_web
-  - generate_image
----
+def _build_doubao_agent_md(mcp_url: str | None = None) -> str:
+    mcp_block = ""
+    if mcp_url:
+        mcp_block = (
+            "mcpServers:\n"
+            f"  - name: {MCP_SERVER_NAME}\n"
+            f"    url: {mcp_url}\n"
+        )
+    return (
+        "---\n"
+        f"name: {DEFAULT_AGY_AGENT_NAME}\n"
+        "description: QQ group chat assistant with web search, QQ context tools, and direct image generation\n"
+        "mainAgent: true\n"
+        "subagent: false\n"
+        "inheritMcp: true\n"
+        f"{mcp_block}"
+        "tools:\n"
+        "  - search_web\n"
+        "  - generate_image\n"
+        "---\n\n"
+        "# Instructions\n"
+        "You are a QQ group chat assistant.\n"
+        "- Use `search_web` for live web information.\n"
+        f"- Use MCP server `{MCP_SERVER_NAME}` (via `call_mcp_tool` with `ServerName=\"{MCP_SERVER_NAME}\"`) for QQ context tools:\n"
+        "  - `fetch_recent_images` (`Arguments={\"limit\": 4, \"offset\": 0}`): Fetch recent QQ group images when the user asks to reference, edit, combine, or redraw recently sent group images that are not already attached.\n"
+        "  - `fetch_user_avatar` (`Arguments={\"user_ref\": \"current_user\"}` or `\"mentioned_user_1\"`): Fetch a QQ user's avatar when the user asks to generate or edit an image containing themselves or a mentioned user, or asks what their avatar looks like.\n"
+        "  - `get_imagegen_instructions` (`Arguments={}`): Fetch `$imagegen` prompt-refinement rules before calling `generate_image`.\n"
+        "- Call `generate_image` directly to generate or edit images. When editing or referencing existing images or avatars, pass their local file paths in `ImagePaths`.\n"
+    )
 
-# Instructions
-You are a QQ group chat assistant. Use `search_web` for live web information and `generate_image` directly when asked to generate or edit an image.
-"""
+
+_DOUBAO_AGENT_MD = _build_doubao_agent_md()
+
+MCP_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "fetch_recent_images",
+        "description": (
+            "Fetch recent QQ images cached by the plugin for the current group. "
+            "Use conservatively when the user asks to reference, edit, combine, redraw, or generate from recently sent images. "
+            "Returns each image's image_id, local file_path (to pass in generate_image ImagePaths), and cached summary."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of cached images to fetch. Prefer 4 to 8 when unsure.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "How many newest cached images to skip. Use 0 first.",
+                },
+            },
+            "required": ["limit", "offset"],
+        },
+    },
+    {
+        "name": "fetch_user_avatar",
+        "description": (
+            "Fetch a QQ user's avatar for this turn by temporary user_ref (e.g. current_user or mentioned_user_1), never by QQ number. "
+            "Returns user_ref, image_id, and local file_path (to pass in generate_image ImagePaths)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "user_ref": {
+                    "type": "string",
+                    "description": "Temporary user reference from this turn, such as current_user or mentioned_user_1.",
+                }
+            },
+            "required": ["user_ref"],
+        },
+    },
+    {
+        "name": "get_imagegen_instructions",
+        "description": (
+            "Return the $imagegen prompt-refinement instructions. "
+            "Call this before using generate_image unless already fetched in this turn."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
+            "required": [],
+        },
+    },
+]
 
 _ALLOWED_DIRECT_TOOLS = {
     "search_web",
     "generate_image",
+    "fetch_recent_images",
+    "fetch_user_avatar",
+    "get_imagegen_instructions",
+    f"mcp_{MCP_SERVER_NAME}_fetch_recent_images",
+    f"mcp_{MCP_SERVER_NAME}_fetch_user_avatar",
+    f"mcp_{MCP_SERVER_NAME}_get_imagegen_instructions",
+}
+_IMAGE_NOTICE_TRIGGER_TOOLS = {
+    "generate_image",
+    "get_imagegen_instructions",
+    f"mcp_{MCP_SERVER_NAME}_get_imagegen_instructions",
 }
 _DENIED_TOOLS = {
     "run_command",
@@ -82,6 +170,7 @@ def get_agy_runtime_dir() -> Path:
 def prepare_agy_runtime(
     runtime_dir: Path | None = None,
     oauth_token_source: Path | None = None,
+    mcp_url: str | None = None,
 ) -> tuple[Path, Path, Path]:
     base_dir = Path(runtime_dir) if runtime_dir is not None else get_agy_runtime_dir()
     gemini_dir = base_dir / "gemini"
@@ -93,8 +182,9 @@ def prepare_agy_runtime(
     agents_dir = cwd_dir / ".agents" / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     agent_file = agents_dir / f"{DEFAULT_AGY_AGENT_NAME}.md"
-    if not agent_file.exists() or agent_file.read_text(encoding="utf-8") != _DOUBAO_AGENT_MD:
-        agent_file.write_text(_DOUBAO_AGENT_MD, encoding="utf-8")
+    agent_md = _build_doubao_agent_md(mcp_url)
+    if not agent_file.exists() or agent_file.read_text(encoding="utf-8") != agent_md:
+        agent_file.write_text(agent_md, encoding="utf-8")
 
     src_token = (
         Path(oauth_token_source)
@@ -182,10 +272,66 @@ def _normalize_tool_identifier(raw_name: Any) -> str:
     if not isinstance(raw_name, str):
         return ""
     cleaned = raw_name.strip().lower()
+    for prefix in ("run ", "mcp tool "):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
     if not cleaned:
         return ""
     token = re.split(r"[\s:(\[]+", cleaned, maxsplit=1)[0]
     return token
+
+
+def _resolve_tool_identifier(
+    tool_obj: dict[str, Any],
+    fallback_obj: dict[str, Any] | None = None,
+) -> str:
+    fallback = fallback_obj if isinstance(fallback_obj, dict) else {}
+    raw_names = [
+        tool_obj.get("toolName"),
+        tool_obj.get("name"),
+        tool_obj.get("tool"),
+        fallback.get("toolName"),
+        fallback.get("name"),
+        fallback.get("tool"),
+        tool_obj.get("title"),
+    ]
+    tool_name = ""
+    for raw in raw_names:
+        normalized = _normalize_tool_identifier(raw)
+        if normalized:
+            tool_name = normalized
+            break
+
+    if tool_name == "call_mcp_tool":
+        for payload_key in ("args", "rawInput"):
+            payload = tool_obj.get(payload_key)
+            if not isinstance(payload, dict):
+                continue
+            server_name = (
+                str(
+                    payload.get("ServerName")
+                    or payload.get("serverName")
+                    or payload.get("server_name")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
+            inner_tool = _normalize_tool_identifier(
+                payload.get("ToolName")
+                or payload.get("toolName")
+                or payload.get("tool_name")
+                or payload.get("name")
+            )
+            if server_name and server_name != MCP_SERVER_NAME:
+                return f"mcp_{server_name}_{inner_tool or 'unknown'}"
+            if inner_tool:
+                return inner_tool
+        title_tool = _normalize_tool_identifier(tool_obj.get("title"))
+        if title_tool and title_tool != "call_mcp_tool":
+            return title_tool
+
+    return tool_name
 
 
 def _pick_permission_option_id(options: Any, *, allow: bool) -> str:
@@ -217,21 +363,7 @@ def evaluate_permission_request(params: dict[str, Any]) -> tuple[bool, str]:
         return False, "reject_once"
 
     tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
-    raw_names = [
-        tool_call.get("toolName"),
-        tool_call.get("name"),
-        tool_call.get("tool"),
-        tool_call.get("title"),
-        params.get("toolName"),
-        params.get("name"),
-        params.get("tool"),
-    ]
-    tool_name = ""
-    for raw in raw_names:
-        normalized = _normalize_tool_identifier(raw)
-        if normalized:
-            tool_name = normalized
-            break
+    tool_name = _resolve_tool_identifier(tool_call, params)
 
     allowed = tool_name not in _DENIED_TOOLS and tool_name in _ALLOWED_DIRECT_TOOLS
     option_id = _pick_permission_option_id(params.get("options"), allow=allowed)
@@ -319,11 +451,217 @@ class AgyAcpClient:
         self._initialized = False
         self._gemini_dir: Path | None = None
         self._cwd_dir: Path | None = None
+        self._mcp_server: asyncio.AbstractServer | None = None
+        self._mcp_url: str | None = None
+        self._active_mcp_handler: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        self._active_mcp_tools: list[dict[str, Any]] = list(MCP_TOOL_DEFINITIONS)
+
+    async def _ensure_mcp_server(self) -> None:
+        if self._mcp_server is not None and self._mcp_url:
+            return
+        server = await asyncio.start_server(
+            self._handle_mcp_connection, "127.0.0.1", 0
+        )
+        sockets = server.sockets or []
+        if not sockets:
+            server.close()
+            await server.wait_closed()
+            raise RuntimeError("无法启动内置 MCP HTTP 服务。")
+        port = sockets[0].getsockname()[1]
+        self._mcp_server = server
+        self._mcp_url = f"http://127.0.0.1:{port}/mcp"
+
+    async def _stop_mcp_server(self) -> None:
+        self._mcp_url = None
+        if self._mcp_server is not None:
+            try:
+                self._mcp_server.close()
+                await self._mcp_server.wait_closed()
+            except Exception:
+                pass
+            self._mcp_server = None
+
+    async def _handle_mcp_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            while True:
+                request_line = await reader.readline()
+                if not request_line:
+                    break
+                parts = request_line.decode("latin-1", errors="replace").strip().split()
+                if len(parts) < 2:
+                    break
+                http_method = parts[0].upper()
+
+                content_length = 0
+                connection_close = False
+                while True:
+                    header_line = await reader.readline()
+                    if not header_line or header_line in (b"\r\n", b"\n"):
+                        break
+                    decoded = header_line.decode("latin-1", errors="replace").strip()
+                    if ":" not in decoded:
+                        continue
+                    k, v = decoded.split(":", 1)
+                    k_lower = k.strip().lower()
+                    v_clean = v.strip()
+                    if k_lower == "content-length":
+                        try:
+                            content_length = int(v_clean)
+                        except ValueError:
+                            content_length = 0
+                    elif k_lower == "connection" and v_clean.lower() == "close":
+                        connection_close = True
+
+                raw_body = (
+                    await reader.readexactly(content_length)
+                    if content_length > 0
+                    else b""
+                )
+                if http_method != "POST":
+                    status, resp_body = 405, b""
+                else:
+                    status, resp_body = await self._dispatch_mcp_payload(raw_body)
+
+                reason = {
+                    200: "OK",
+                    202: "Accepted",
+                    400: "Bad Request",
+                    405: "Method Not Allowed",
+                }.get(status, "OK")
+                headers = [
+                    f"HTTP/1.1 {status} {reason}",
+                    f"Content-Length: {len(resp_body)}",
+                ]
+                if resp_body:
+                    headers.append("Content-Type: application/json; charset=utf-8")
+                if connection_close:
+                    headers.append("Connection: close")
+                writer.write(("\r\n".join(headers) + "\r\n\r\n").encode("latin-1") + resp_body)
+                await writer.drain()
+                if connection_close:
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logger.warning(f"agy_acp MCP HTTP connection error: {exc}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _dispatch_mcp_payload(self, raw_body: bytes) -> tuple[int, bytes]:
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            return 400, b""
+        if not isinstance(body, dict):
+            return 400, b""
+
+        method = body.get("method")
+        req_id = body.get("id")
+        if req_id is None or method in (
+            "notifications/initialized",
+            "notifications/roots/list_changed",
+        ):
+            return 202, b""
+
+        if method == "initialize":
+            return 200, json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": MCP_SERVER_NAME, "version": "1.0.0"},
+                    },
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+        if method == "ping":
+            return 200, json.dumps(
+                {"jsonrpc": "2.0", "id": req_id, "result": {}}
+            ).encode("utf-8")
+
+        if method == "tools/list":
+            return 200, json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {"tools": self._active_mcp_tools},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+        if method == "tools/call":
+            params = body.get("params") or {}
+            tool_name = str(params.get("name") or "").strip()
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            handler = self._active_mcp_handler
+            if handler is None:
+                return 200, json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [{"type": "text", "text": "当前轮次未绑定 MCP 工具处理器。"}],
+                            "isError": True,
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            try:
+                raw_result = await handler(tool_name, arguments)
+                if isinstance(raw_result, list):
+                    content_blocks = raw_result
+                elif isinstance(raw_result, str):
+                    content_blocks = [{"type": "text", "text": raw_result}]
+                else:
+                    content_blocks = [
+                        {
+                            "type": "text",
+                            "text": json.dumps(raw_result, ensure_ascii=False),
+                        }
+                    ]
+                return 200, json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"content": content_blocks},
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            except Exception as exc:
+                logger.warning(f"agy_acp MCP tool '{tool_name}' failed: {exc}")
+                return 200, json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [{"type": "text", "text": f"工具执行失败: {exc}"}],
+                            "isError": True,
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        # Return HTTP 400 for legacy discovery probes (e.g. server/discover) so agy
+        # immediately falls back to standard MCP 2024-11-05 Streamable HTTP.
+        return 400, b""
 
     async def _spawn_process(self) -> Any:
+        await self._ensure_mcp_server()
         _, gemini_dir, cwd_dir = prepare_agy_runtime(
             runtime_dir=self.runtime_dir,
             oauth_token_source=self.oauth_token_source,
+            mcp_url=self._mcp_url,
         )
         self._gemini_dir = gemini_dir
         self._cwd_dir = cwd_dir
@@ -363,9 +701,11 @@ class AgyAcpClient:
             and getattr(self._proc, "returncode", None) is None
             and self._initialized
         ):
+            await self._ensure_mcp_server()
             return
 
         await self._reset_process()
+        await self._ensure_mcp_server()
         self._proc = await self._spawn_process()
         self._reader_task = asyncio.create_task(self._reader_loop())
 
@@ -384,6 +724,7 @@ class AgyAcpClient:
 
     async def _reset_process(self) -> None:
         self._initialized = False
+        self._active_mcp_handler = None
         if self._reader_task is not None:
             self._reader_task.cancel()
             try:
@@ -404,6 +745,8 @@ class AgyAcpClient:
             except Exception:
                 pass
             self._proc = None
+
+        await self._stop_mcp_server()
 
         for future in self._pending.values():
             if not future.done():
@@ -509,13 +852,15 @@ class AgyAcpClient:
 
         if method == "session/request_permission":
             allowed, option_id = evaluate_permission_request(params)
-            tool_call = params.get("toolCall") or {}
+            tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+            resolved_tool = _resolve_tool_identifier(tool_call, params)
             tool_label = (
-                tool_call.get("toolName")
+                resolved_tool
+                or tool_call.get("toolName")
                 or tool_call.get("name")
                 or tool_call.get("title")
             )
-            if allowed and _normalize_tool_identifier(tool_label) == "generate_image":
+            if allowed and resolved_tool in _IMAGE_NOTICE_TRIGGER_TOOLS:
                 req_sid = str(params.get("sessionId") or "")
                 if req_sid:
                     self._trigger_image_notice(req_sid)
@@ -563,21 +908,19 @@ class AgyAcpClient:
 
         update_type = update.get("sessionUpdate") or update.get("type")
         if update_type in ("tool_call", "tool_call_update"):
-            tool_name = _normalize_tool_identifier(
-                update.get("name") or update.get("toolName") or update.get("title")
-            )
-            if tool_name == "generate_image":
+            tool_name = _resolve_tool_identifier(update)
+            if tool_name in _IMAGE_NOTICE_TRIGGER_TOOLS:
                 self._trigger_image_notice(session_id)
-                if update.get("status") == "completed":
-                    for img_path in _extract_saved_image_paths_from_update(update):
-                        if img_path.is_file():
-                            try:
-                                self._session_images.setdefault(session_id, []).append(
-                                    img_path.read_bytes()
-                                )
-                                img_path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
+            if tool_name == "generate_image" and update.get("status") == "completed":
+                for img_path in _extract_saved_image_paths_from_update(update):
+                    if img_path.is_file():
+                        try:
+                            self._session_images.setdefault(session_id, []).append(
+                                img_path.read_bytes()
+                            )
+                            img_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
             steps = self._session_text_steps.setdefault(session_id, [[]])
             if steps and steps[-1]:
                 steps.append([])
@@ -613,6 +956,9 @@ class AgyAcpClient:
         prompt_blocks: list[dict[str, Any]],
         model_info: dict[str, Any] | None = None,
         on_image_generation_start: Callable[[], Awaitable[None]] | None = None,
+        mcp_tool_handler: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
+        mcp_tools: list[dict[str, Any]] | None = None,
+        extra_input_hashes: set[str] | Callable[[], set[str]] | None = None,
     ) -> AcpTurnResult:
         model_info = model_info or {}
         async with self._lock:
@@ -623,15 +969,26 @@ class AgyAcpClient:
                 p for p in self._cwd_dir.rglob("*") if p.is_file()
             }
 
+            self._active_mcp_handler = mcp_tool_handler
+            self._active_mcp_tools = (
+                list(mcp_tools) if mcp_tools is not None else list(MCP_TOOL_DEFINITIONS)
+            )
+            mcp_servers = (
+                [{"name": MCP_SERVER_NAME, "url": self._mcp_url}]
+                if (self._mcp_url and mcp_tool_handler is not None)
+                else []
+            )
+
             session_res = await self._send_request(
                 "session/new",
                 {
                     "cwd": str(self._cwd_dir),
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers,
                 },
             )
             session_id = str((session_res or {}).get("sessionId") or "")
             if not session_id:
+                self._active_mcp_handler = None
                 raise RuntimeError("agy acp 未返回有效的 sessionId。")
 
             self._session_text_steps[session_id] = [[]]
@@ -671,6 +1028,10 @@ class AgyAcpClient:
                 )
 
                 input_hashes: set[str] = set()
+                if callable(extra_input_hashes):
+                    input_hashes.update(extra_input_hashes())
+                elif isinstance(extra_input_hashes, set):
+                    input_hashes.update(extra_input_hashes)
                 for block in prompt_blocks:
                     if isinstance(block, dict) and block.get("type") == "image":
                         b64_data = block.get("data")
@@ -687,7 +1048,12 @@ class AgyAcpClient:
                 )
                 brain_images, _ = _extract_images_from_dir(
                     session_brain_dir,
-                    ignore_dir_names={".user_uploaded", ".system_generated", "scratch"},
+                    ignore_dir_names={
+                        ".user_uploaded",
+                        ".system_generated",
+                        "scratch",
+                        "inputs",
+                    },
                 )
                 cwd_images, cwd_image_paths = _extract_images_from_dir(
                     self._cwd_dir,
@@ -727,6 +1093,7 @@ class AgyAcpClient:
                     text_steps=text_steps,
                 )
             finally:
+                self._active_mcp_handler = None
                 self._session_text_steps.pop(session_id, None)
                 self._session_images.pop(session_id, None)
                 self._session_notice_callbacks.pop(session_id, None)

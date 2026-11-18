@@ -238,12 +238,53 @@ class AgyAcpTest(unittest.TestCase):
             {"optionId": "reject_once", "kind": "reject_once"},
         ]
 
-        for allowed_tool in ("search_web", "generate_image"):
+        for allowed_tool in (
+            "search_web",
+            "generate_image",
+            "mcp_qq_context_fetch_recent_images",
+            "mcp_qq_context_fetch_user_avatar",
+            "mcp_qq_context_get_imagegen_instructions",
+            "Run mcp_qq_context_fetch_user_avatar",
+            "MCP Tool fetch_user_avatar",
+        ):
             allowed, opt = agy_acp.evaluate_permission_request(
                 {"toolCall": {"name": allowed_tool}, "options": options}
             )
             self.assertTrue(allowed, msg=allowed_tool)
             self.assertEqual(opt, "allow_once")
+
+        allowed_mcp_call, opt = agy_acp.evaluate_permission_request(
+            {
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": "qq_context",
+                        "ToolName": "fetch_user_avatar",
+                        "Arguments": {"user_ref": "current_user"},
+                    },
+                    "title": "MCP Tool fetch_user_avatar",
+                },
+                "options": options,
+            }
+        )
+        self.assertTrue(allowed_mcp_call)
+        self.assertEqual(opt, "allow_once")
+
+        for denied_mcp_payload in (
+            {"ServerName": "other_server", "ToolName": "fetch_user_avatar"},
+            {"ServerName": "qq_context", "ToolName": "run_command"},
+        ):
+            allowed_bad, opt_bad = agy_acp.evaluate_permission_request(
+                {
+                    "toolCall": {
+                        "name": "call_mcp_tool",
+                        "args": denied_mcp_payload,
+                    },
+                    "options": options,
+                }
+            )
+            self.assertFalse(allowed_bad)
+            self.assertEqual(opt_bad, "reject_once")
 
         for denied_tool in (
             "run_command",
@@ -298,11 +339,14 @@ class AgyAcpTest(unittest.TestCase):
             _, gemini_dir, cwd_dir = agy_acp.prepare_agy_runtime(
                 runtime_dir=runtime_dir,
                 oauth_token_source=token_src,
+                mcp_url="http://127.0.0.1:54321/mcp",
             )
             self.assertTrue((cwd_dir / ".git").is_dir())
             agent_file = cwd_dir / ".agents" / "agents" / "doubao.md"
             self.assertTrue(agent_file.is_file())
-            self.assertIn("generate_image", agent_file.read_text(encoding="utf-8"))
+            agent_text = agent_file.read_text(encoding="utf-8")
+            self.assertIn("generate_image", agent_text)
+            self.assertIn("http://127.0.0.1:54321/mcp", agent_text)
             token_dst = gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
             self.assertTrue(token_dst.is_symlink())
             self.assertEqual(token_dst.read_text(encoding="utf-8"), "oauth-secret")
@@ -430,6 +474,102 @@ class AgyAcpTest(unittest.TestCase):
                 ignore_dir_names={".user_uploaded", ".system_generated"},
             )
             self.assertEqual(images, [b"gen-img"])
+
+    def test_in_process_mcp_http_server_lifecycle(self):
+        async def post_raw(port: int, body: dict) -> tuple[int, bytes]:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            raw = json.dumps(body).encode("utf-8")
+            req = (
+                f"POST /mcp HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(raw)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("latin-1") + raw
+            writer.write(req)
+            await writer.drain()
+            status_line = (await reader.readline()).decode("latin-1").strip()
+            status_code = int(status_line.split()[1])
+            while True:
+                line = await reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+            resp_body = await reader.read()
+            writer.close()
+            await writer.wait_closed()
+            return status_code, resp_body
+
+        async def run_test():
+            client = agy_acp.AgyAcpClient()
+            await client._ensure_mcp_server()
+            try:
+                assert client._mcp_url is not None
+                port = int(client._mcp_url.split(":")[2].split("/")[0])
+
+                # Legacy server/discover probe should return 400
+                status, _ = await post_raw(
+                    port, {"jsonrpc": "2.0", "id": 1, "method": "server/discover"}
+                )
+                self.assertEqual(status, 400)
+
+                # Standard initialize -> 200
+                status, body = await post_raw(
+                    port, {"jsonrpc": "2.0", "id": 2, "method": "initialize"}
+                )
+                self.assertEqual(status, 200)
+                init_res = json.loads(body.decode("utf-8"))
+                self.assertEqual(init_res["result"]["serverInfo"]["name"], "qq_context")
+
+                # Notification -> 202
+                status, _ = await post_raw(
+                    port, {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                )
+                self.assertEqual(status, 202)
+
+                # tools/list -> 200
+                status, body = await post_raw(
+                    port, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+                )
+                self.assertEqual(status, 200)
+                tools_res = json.loads(body.decode("utf-8"))
+                tool_names = [t["name"] for t in tools_res["result"]["tools"]]
+                self.assertEqual(
+                    tool_names,
+                    [
+                        "fetch_recent_images",
+                        "fetch_user_avatar",
+                        "get_imagegen_instructions",
+                    ],
+                )
+
+                # tools/call with handler bound
+                async def fake_handler(name: str, args: dict):
+                    return {"tool": name, "user_ref": args.get("user_ref")}
+
+                client._active_mcp_handler = fake_handler
+                status, body = await post_raw(
+                    port,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "fetch_user_avatar",
+                            "arguments": {"user_ref": "current_user"},
+                        },
+                    },
+                )
+                self.assertEqual(status, 200)
+                call_res = json.loads(body.decode("utf-8"))
+                self.assertEqual(
+                    json.loads(call_res["result"]["content"][0]["text"]),
+                    {"tool": "fetch_user_avatar", "user_ref": "current_user"},
+                )
+            finally:
+                await client._stop_mcp_server()
+                self.assertIsNone(client._mcp_url)
+
+        asyncio.run(run_test())
 
 
 if __name__ == "__main__":
