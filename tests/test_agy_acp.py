@@ -571,6 +571,47 @@ class AgyAcpTest(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_idle_timeout_reaps_process_and_respawns_on_next_turn(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime_dir = Path(tmp) / "runtime"
+                spawned: list[_FakeAcpProcess] = []
+
+                async def factory(cmd, cwd):
+                    idx = len(spawned) + 1
+                    proc = _FakeAcpProcess(
+                        runtime_dir=runtime_dir,
+                        session_id=f"idle-{idx}",
+                    )
+                    spawned.append(proc)
+                    return proc
+
+                client = agy_acp.AgyAcpClient(
+                    runtime_dir=runtime_dir,
+                    process_factory=factory,
+                    timeout_seconds=5.0,
+                    idle_timeout_seconds=0.05,
+                )
+                try:
+                    await client.run_turn(
+                        prompt_blocks=[{"type": "text", "text": "turn 1"}],
+                    )
+                    self.assertEqual(len(spawned), 1)
+                    self.assertIsNotNone(client._proc)
+
+                    await asyncio.sleep(0.12)
+                    self.assertIsNone(client._proc)
+                    self.assertIsNone(client._mcp_url)
+
+                    await client.run_turn(
+                        prompt_blocks=[{"type": "text", "text": "turn 2"}],
+                    )
+                    self.assertEqual(len(spawned), 2)
+                finally:
+                    await client.close()
+
+        asyncio.run(run_test())
+
 
 if __name__ == "__main__":
     unittest.main()

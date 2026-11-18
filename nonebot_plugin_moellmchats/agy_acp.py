@@ -21,6 +21,9 @@ except ImportError:  # pragma: no cover - fallback for standalone unit tests
 DEFAULT_AGY_MODEL = "gemini-4-hydrogen-medium"
 DEFAULT_AGY_AGENT_NAME = "doubao"
 DEFAULT_ACP_TIMEOUT_SECONDS = 300.0
+DEFAULT_ACP_IDLE_TIMEOUT_SECONDS = float(
+    os.getenv("MOELLMCHATS_AGY_ACP_IDLE_TIMEOUT_SECONDS", "1800")
+)
 MCP_SERVER_NAME = "qq_context"
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
 _SAVED_IMAGE_PATH_RE = re.compile(r"Generated image is saved at\s+([^\r\n]+?)(?:\.\s*$|$)")
@@ -432,15 +435,19 @@ class AgyAcpClient:
         oauth_token_source: Path | None = None,
         process_factory: Callable[..., Any] | None = None,
         timeout_seconds: float = DEFAULT_ACP_TIMEOUT_SECONDS,
+        idle_timeout_seconds: float = DEFAULT_ACP_IDLE_TIMEOUT_SECONDS,
     ):
         self.runtime_dir = runtime_dir
         self.oauth_token_source = oauth_token_source
         self._process_factory = process_factory
         self.timeout_seconds = timeout_seconds
+        self.idle_timeout_seconds = idle_timeout_seconds
 
         self._lock = asyncio.Lock()
         self._proc: Any = None
         self._reader_task: asyncio.Task | None = None
+        self._idle_task: asyncio.Task | None = None
+        self._active_turns = 0
         self._next_id = 1
         self._pending: dict[int | str, asyncio.Future] = {}
         self._session_text_steps: dict[str, list[list[str]]] = {}
@@ -722,7 +729,34 @@ class AgyAcpClient:
         )
         self._initialized = True
 
+    def _cancel_idle_timer(self) -> None:
+        current = asyncio.current_task()
+        if self._idle_task is not None and self._idle_task is not current:
+            self._idle_task.cancel()
+        self._idle_task = None
+
+    def _schedule_idle_timer(self) -> None:
+        self._cancel_idle_timer()
+        if self.idle_timeout_seconds <= 0 or self._proc is None:
+            return
+        delay = self.idle_timeout_seconds
+
+        async def _reap_when_idle() -> None:
+            try:
+                await asyncio.sleep(delay)
+                async with self._lock:
+                    if self._active_turns == 0 and not self._pending:
+                        logger.info(
+                            f"Closing idle agy acp subprocess after {delay:.0f}s of inactivity"
+                        )
+                        await self._reset_process()
+            except asyncio.CancelledError:
+                return
+
+        self._idle_task = asyncio.create_task(_reap_when_idle())
+
     async def _reset_process(self) -> None:
+        self._cancel_idle_timer()
         self._initialized = False
         self._active_mcp_handler = None
         if self._reader_task is not None:
@@ -960,8 +994,34 @@ class AgyAcpClient:
         mcp_tools: list[dict[str, Any]] | None = None,
         extra_input_hashes: set[str] | Callable[[], set[str]] | None = None,
     ) -> AcpTurnResult:
-        model_info = model_info or {}
         async with self._lock:
+            self._active_turns += 1
+            self._cancel_idle_timer()
+            try:
+                return await self._run_turn_locked(
+                    prompt_blocks=prompt_blocks,
+                    model_info=model_info or {},
+                    on_image_generation_start=on_image_generation_start,
+                    mcp_tool_handler=mcp_tool_handler,
+                    mcp_tools=mcp_tools,
+                    extra_input_hashes=extra_input_hashes,
+                )
+            finally:
+                self._active_turns = max(0, self._active_turns - 1)
+                if self._active_turns == 0:
+                    self._schedule_idle_timer()
+
+    async def _run_turn_locked(
+        self,
+        *,
+        prompt_blocks: list[dict[str, Any]],
+        model_info: dict[str, Any],
+        on_image_generation_start: Callable[[], Awaitable[None]] | None,
+        mcp_tool_handler: Callable[[str, dict[str, Any]], Awaitable[Any]] | None,
+        mcp_tools: list[dict[str, Any]] | None,
+        extra_input_hashes: set[str] | Callable[[], set[str]] | None,
+    ) -> AcpTurnResult:
+        if True:
             await self._ensure_started()
             assert self._gemini_dir is not None and self._cwd_dir is not None
 

@@ -18,12 +18,14 @@ class ImageStore:
         self.max_bytes = max_bytes
         self.max_records = max_records
         self.max_entries = max_entries
+        self._last_cleanup_at: float | None = None
 
     @contextmanager
     def _connect(self):
         db = sqlite3.connect(self.database, timeout=5)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA synchronous=NORMAL")
         try:
             with db:
                 yield db
@@ -50,6 +52,9 @@ class ImageStore:
                 );
                 CREATE INDEX IF NOT EXISTS refs_recent ON refs (group_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS refs_expiry ON refs (expires_at);
+                CREATE INDEX IF NOT EXISTS refs_image ON refs (image_id);
+                CREATE INDEX IF NOT EXISTS urls_image ON urls (image_id);
+                CREATE INDEX IF NOT EXISTS urls_expiry ON urls (expires_at);
             """)
         self.cleanup(now)
         # Recover files left by an interrupted write, without touching the legacy cache.
@@ -118,16 +123,24 @@ class ImageStore:
             )
 
     def attach(self, record, url, refs, now):
+        needs_cleanup = (
+            self._last_cleanup_at is None or (now - self._last_cleanup_at) >= 30.0
+        )
         with self._connect() as db:
             if db.execute("SELECT 1 FROM images WHERE image_id=?", (record["image_id"],)).fetchone() is None:
                 return None
             self._attach(db, record["image_id"], url, refs)
             db.execute("UPDATE urls SET expires_at=? WHERE url=?", (now + self.ttl, url))
             db.execute("UPDATE images SET accessed_at=? WHERE image_id=?", (now, record["image_id"]))
-        self.cleanup(now)
+            if not needs_cleanup:
+                total = db.execute("SELECT COALESCE(SUM(size),0) FROM images").fetchone()[0]
+                needs_cleanup = total > self.max_bytes
+        if needs_cleanup:
+            self.cleanup(now)
         return self.lookup(url, now)
 
     def cleanup(self, now):
+        self._last_cleanup_at = now
         deleted = []
         with self._connect() as db:
             db.execute("DELETE FROM refs WHERE expires_at<=?", (now,))
